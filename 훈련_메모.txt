@@ -1,0 +1,8 @@
+
+다음 실험에서는 anchor 수를 줄이고, lr을 올려보자
+
+DBSCAN 대신 Affinity Propagation을 해보자
+
+tensorboard --logdir="/workspace/models_storage/cluster/log" --bind_all
+
+service ssh start
