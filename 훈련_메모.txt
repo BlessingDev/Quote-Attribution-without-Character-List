@@ -1,8 +1,42 @@
 
 다음 실험에서는 anchor 수를 줄이고, lr을 올려보자
 
-DBSCAN 대신 Affinity Propagation을 해보자
+HDBSCAN 대신 Affinity Propagation을 해보자(나중)
 
-tensorboard --logdir="/workspace/models_storage/cluster/log" --bind_all
+정말 anchor 수와 memory step이 성능에 영향을 주는지 확인해 볼 필요가 있을 것 같다.
+
+decoder 마지막에 tanh 활성 함수를 두어 자유도를 제한하도록 하는 시도도 해볼만 할 듯
+군집이 너무 안 만들어지는 경향이 있다.
+
+loss에 대한 분석도 필요하다.
+분석 완료. neg_spcl의 영향을 줄일 필요가 있음.
+
+세팅 변경 이력
+0529_1724부터
+- log(l+1) 로스 적용
+
+0530_1245
+- 마지막 선형 변환 후에 tanh 변환 적용
+- 의미 없음. 오히려 약간 떨어짐.
+
+0530_1814
+- tanh층 제거
+- mem step 늘림
+- 확실히 더 일반화되는 느낌 있음. v1과 loss 사이의 consistency도 증가.
+
+0531_0955
+- anchor 저장 무한하게
+
+0531_
+- narrative를 군집화에서 제외(positive loss 계산 안 함)
+- beta 도입(기본값 0.5 사용)
+
+추후
+anchor 저장 무한하게. 어차피 backward 한 번에 다 버리니까.
+domain incremental 고려 (여러 권의 책으로 batch 구성)
+class imbalance 문제 고려
+여타 prototypical classification 연구 탐색
+
+tensorboard --logdir="/workspace/models_storage/cluster/mse_loss/log" --bind_all
 
 service ssh start

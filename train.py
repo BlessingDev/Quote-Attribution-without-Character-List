@@ -145,6 +145,8 @@ def update_anchor(
     # 추후 앵커를 잊고, 갱신하는 구조가 필요할지도 모르겠다.
     # 현재는 계속 추가하는 구조만 있고, 설명 문단은 첫 배치에 바로 채워져버릴 것
     
+    anchor_num = 100 # anchor 제한을 무력화하여 최대한 많이 저장할 수 있도록 함.
+    
     # 우선 현재 batch의 구성을 살펴보도록 하자
     for i, speaker in enumerate(batch_dict["speaker"]):
         # 아직 한 번도 등록 안 된 앵커인지
@@ -313,6 +315,8 @@ def detach_achors(achor_info:dict):
             achor_info[k][i] = feature.contiguous().detach()
 
 def train_model(args, data_set, model):
+    print(args)
+    
     optimizer = optim.Adam(
         model.parameters(), 
         lr=args.learning_rate, 
@@ -351,6 +355,8 @@ def train_model(args, data_set, model):
     train_state = make_train_state(args)
     tokenizer = data_set.tokenizer
     
+    if args.test:
+        torch.autograd.set_detect_anomaly(True)
     
     try:
         for epoch_index in range(args.max_epochs):
@@ -435,12 +441,13 @@ def train_model(args, data_set, model):
                     global_step=epoch_index
                 )'''
                 
-                homo, comp, v1, fig = metric.calc_v_measure_with_hdb(labels=speakers, features=np.array(cls_features))
-                tf_writer.add_scalar(tag="book{0}/train/v1".format(book), scalar_value=v1, global_step=epoch_index)
-                tf_writer.add_scalar(tag="book{0}/train/homogeneity".format(book), scalar_value=homo, global_step=epoch_index)
-                tf_writer.add_scalar(tag="book{0}/train/completeness".format(book), scalar_value=comp, global_step=epoch_index)
-                
-                tf_writer.add_figure(tag="book{0}/train/cluster result".format(book), figure=fig, global_step=epoch_index)
+                if not args.test:
+                    homo, comp, v1, fig = metric.calc_v_measure_with_hdb(labels=speakers, features=np.array(cls_features))
+                    tf_writer.add_scalar(tag="book{0}/train/v1".format(book), scalar_value=v1, global_step=epoch_index)
+                    tf_writer.add_scalar(tag="book{0}/train/homogeneity".format(book), scalar_value=homo, global_step=epoch_index)
+                    tf_writer.add_scalar(tag="book{0}/train/completeness".format(book), scalar_value=comp, global_step=epoch_index)
+                    
+                    tf_writer.add_figure(tag="book{0}/train/cluster result".format(book), figure=fig, global_step=epoch_index)
 
                 data_set.set_book(book)
                 train_bar = tqdm.tqdm(desc='book{0}'.format(book),
@@ -519,9 +526,6 @@ def train_model(args, data_set, model):
                     
                     anchor_info = update_anchor(anchor_info, args.saved_anchor_num, batch_dict, y_pred[0])
                     
-                    cls_features.extend([feature.detach().cpu().numpy() for feature in y_pred[0][0][batch_dict["cls_index"]]])
-                    speakers.extend(batch_dict["speaker"])
-                    
                     loss += cur_loss
                     # 이동 손실과 이동 정확도를 계산합니다
                     running_loss += (cur_loss.item() - running_loss) / (batch_index + 1)
@@ -569,7 +573,9 @@ def train_model(args, data_set, model):
                 #train_state['train_acc'].append(running_acc)
                 tf_writer.add_scalar(tag="book{0}/train/loss".format(book), scalar_value=running_loss, global_step=epoch_index)
 
-                book_bar.set_postfix(loss=running_loss, v1=v1)
+                if not args.test:
+                    book_bar.set_postfix(loss=running_loss, v1=v1)
+                
                 book_bar.update()
 
                 tf_writer.flush()
@@ -648,12 +654,13 @@ def train_model(args, data_set, model):
                     global_step=epoch_index
                 )'''
 
-                homo, comp, v1, fig = metric.calc_v_measure_with_hdb(labels=speakers, features=np.array(cls_features))
-                tf_writer.add_scalar(tag="book{0}/val/v1".format(book), scalar_value=v1, global_step=epoch_index)
-                tf_writer.add_scalar(tag="book{0}/val/homogeneity".format(book), scalar_value=homo, global_step=epoch_index)
-                tf_writer.add_scalar(tag="book{0}/val/completeness".format(book), scalar_value=comp, global_step=epoch_index)
+                if not args.test:
+                    homo, comp, v1, fig = metric.calc_v_measure_with_hdb(labels=speakers, features=np.array(cls_features))
+                    tf_writer.add_scalar(tag="book{0}/val/v1".format(book), scalar_value=v1, global_step=epoch_index)
+                    tf_writer.add_scalar(tag="book{0}/val/homogeneity".format(book), scalar_value=homo, global_step=epoch_index)
+                    tf_writer.add_scalar(tag="book{0}/val/completeness".format(book), scalar_value=comp, global_step=epoch_index)
 
-                tf_writer.add_figure(tag="book{0}/val/cluster result".format(book), figure=fig, global_step=epoch_index)
+                    tf_writer.add_figure(tag="book{0}/val/cluster result".format(book), figure=fig, global_step=epoch_index)
                 
                 # 검증 세트와 배치 제너레이터 준비, 손실과 정확도를 0으로 설정
                 data_set.set_book(book)
@@ -744,7 +751,8 @@ def train_model(args, data_set, model):
                     
 
                 running_loss += (loss.item() - running_loss) / (val_batch_idx + 1)
-                running_v1 += (v1 - running_v1) / (val_batch_idx + 1)
+                if not args.test:
+                    running_v1 += (v1 - running_v1) / (val_batch_idx + 1)
 
                 book_bar.set_postfix(loss=running_loss, v1=running_v1)
                 book_bar.update()
@@ -909,12 +917,14 @@ def main():
     
     parser.add_argument(
         "--reload_from_files",
-        default=False
+        default=False,
+        type=bool
     )
     
     parser.add_argument(
         "--expand_filepaths_to_save_dir",
-        default=True
+        default=True,
+        type=bool
     )
     
     parser.add_argument(
@@ -924,7 +934,14 @@ def main():
     
     parser.add_argument(
         "--catch_keyboard_interrupt",
-        default=True
+        default=True,
+        type=bool
+    )
+    
+    parser.add_argument(
+        "--test",
+        default=False,
+        type=bool
     )
     
     '''args = parser.parse_args([
@@ -934,11 +951,12 @@ def main():
         "--latent_dimension", "1024",
         "--decoder_hidden", "4096",
         "--saved_anchor_num", "3",
-        "--detach_mems_step", "15",
-        "--learning_rate", "1e-6",
-        "--weight_decay", "0.0",
+        "--detach_mems_step", "5",
+        "--learning_rate", "1e-5",
+        "--weight_decay", "0.1",
         "--seed", "201456",
         "--temperature", "0.7",
+        "--test", "True",
     ])'''
 
     args = parser.parse_args()

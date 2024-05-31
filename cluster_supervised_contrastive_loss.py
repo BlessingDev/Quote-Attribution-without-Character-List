@@ -1,13 +1,15 @@
 import torch
 import torch.nn as nn
 import torch.functional as F
+import numpy as np
 
 class ProtoSupConLoss(nn.Module):
-    def __init__(self, phi, centroids, temperature=0.7):
+    def __init__(self, phi, centroids, temperature=0.7, beta=0.5):
         super(ProtoSupConLoss, self).__init__()
         self.temperature = temperature
         self.phi = phi
         self.centroids = centroids
+        self.beta = beta
     
     def forward(self, features, labels):
         device = (torch.device('cuda')
@@ -40,75 +42,84 @@ class ProtoSupConLoss(nn.Module):
         for batch_idx, batch_dict in enumerate(label_dicts):
             # 각 레이블마다 positive negative 구하여 로스 계산
             for k in batch_dict.keys():
-                positive_features = features[batch_idx, batch_dict[k]]
+                if k != '':
+                    # narrative가 아닐 때만 positive를 계산
+                    # narrative는 negative만 계산된다.
+                    # 각 speaker는 narrative에서 멀어지는 쪽으로만 학습. narrative는 서로 가까워지지 않는다.
+                    positive_features = features[batch_idx, batch_dict[k]]
+                    negative_indices = [idx for idx in range(sample_size) if k != labels[batch_idx][idx]]
 
-                positive_num = len(batch_dict[k])
+                    # 각 레이블에 들어있는 샘플을 순회
+                    for i in range(len(batch_dict[k])):
+                        negative_indices = [idx for idx in range(sample_size) if idx != i]
+                        cur_feature = positive_features[i]
+                        if len(negative_indices) > 0:
+                            # cos 유사도 대신 L2 거리를 사용
+                            #negative_loss = torch.div(torch.matmul(cur_feature, negative_features.T), self.temperature).view(1, -1)
+                            negative_loss = torch.stack([torch.div(mse_loss(cur_feature, features[batch_idx, neg_idx]), self.temperature) for neg_idx in negative_indices]).view(1, -1)
+                            # 수치 안정성을 위해서
+                            logits = negative_loss / dim_norm_factor
+                            #logits = logits / negative_features.shape[0]
 
-                # 각 레이블에 들어있는 샘플을 순회
-                for i in range(len(batch_dict[k])):
-                    negative_indices = [idx for idx in range(sample_size) if idx != i]
-                    cur_feature = positive_features[i]
-                    if len(negative_indices) > 0:
-                        # cos 유사도 대신 L2 거리를 사용
-                        #negative_loss = torch.div(torch.matmul(cur_feature, negative_features.T), self.temperature).view(1, -1)
-                        negative_loss = torch.stack([torch.div(mse_loss(cur_feature, features[batch_idx, neg_idx]), self.temperature) for neg_idx in negative_indices]).view(1, -1)
-                        # 수치 안정성을 위해서
-                        logits = negative_loss / dim_norm_factor
-                        #logits = logits / negative_features.shape[0]
+                            # negative 거리의 영향을 줄이기 위해 평균을 구함
+                            # postive 거리의 평균합은 이제 negative 거리의 평균합보다 훨씬 작아져야 함
+                            neg_sup = torch.mean(torch.exp(logits))
+                            
+                            pos_sub = [torch.Tensor([0])]
 
-                        neg_sup = torch.sum(torch.exp(logits))
+                            for j in range(len(batch_dict[k])):
+                                if i != j:
+                                    #anchor_contrast = torch.div(torch.matmul(cur_feature, positive_features[j]), self.temperature)
+                                    anchor_contrast = torch.div(mse_loss(cur_feature, positive_features[j]), self.temperature)
+                                    norm_contrast = anchor_contrast / dim_norm_factor
+
+                                    pos_logit = torch.exp(norm_contrast)
+
+                                    pos_sub.append(pos_logit)
+
+                            if len(pos_sub) > 1:
+                                pos_sub.pop(0)
+                            pos_sub = torch.stack(pos_sub)
+                            norm_pos_sup = torch.mean(pos_sub)
+
                         
-                        pos_sub = torch.zeros(1).to(device)
+                            pos_cent = torch.Tensor(self.centroids[k]).to(device)
+                            pos_phi = torch.Tensor([self.phi[k]]).to(device)
+                            
+                            # 현재 positive가 아닌 모든 label의 집합
+                            neg_label_set = set([l for l in self.centroids.keys() if l != k])
 
-                        for j in range(len(batch_dict[k])):
-                            if i != j:
-                                #anchor_contrast = torch.div(torch.matmul(cur_feature, positive_features[j]), self.temperature)
-                                anchor_contrast = torch.div(mse_loss(cur_feature, positive_features[j]), self.temperature)
-                                norm_contrast = anchor_contrast / dim_norm_factor
+                            neg_cents = torch.stack([torch.Tensor(self.centroids[n_l]).to(device) for n_l in neg_label_set])
+                            neg_phis = torch.stack([torch.Tensor([self.phi[n_l]]).to(device) for n_l in neg_label_set])
+                            
+                            #cent_contrast = torch.div(torch.matmul(cur_feature, pos_cent), pos_phi).view(1, -1)
+                            cent_contrast = torch.div(mse_loss(cur_feature, pos_cent), pos_phi).view(1, -1)
+                            norm_contrast = cent_contrast / dim_norm_factor
+                            pos_cent_logit = torch.exp(norm_contrast)
+                            
+                            #negative_cent_loss = torch.div(torch.matmul(cur_feature, neg_cents.T), neg_phis)
+                            negative_cent_loss = torch.stack([torch.div(mse_loss(cur_feature, neg_cents[idx]), neg_phis[idx]) for idx in range(neg_cents.shape[0])])
+                            # 수치 안정성을 위해서
+                            logits = negative_cent_loss / dim_norm_factor
+                            #logits = logits / neg_cents.shape[0]
 
-                                pos_logit = torch.exp(norm_contrast)
+                            negative_cent_logits = torch.mean(torch.exp(logits))
 
-                                pos_sub += pos_logit
+                            pos_spcl = self.beta * norm_pos_sup + (1 - self.beta) * pos_cent_logit
+                            neg_spcl = self.beta * neg_sup + (1 - self.beta) * negative_cent_logits
+                            
+                            #norm_prob = torch.multiply(torch.div(1, positive_num + 1), torch.div(pos_spcl, neg_spcl))
+                            #norm_prob = torch.log(norm_prob)
 
-                        #norm_probs = torch.multiply(torch.div(1, positive_num), pos_sub)
+                            total_prob = torch.div(pos_spcl, neg_spcl)
 
-                    
-                        pos_cent = torch.Tensor(self.centroids[k]).to(device)
-                        pos_phi = torch.Tensor([self.phi[k]]).to(device)
-                        
-                        # 현재 positive가 아닌 모든 label의 집합
-                        neg_label_set = set([l for l in self.centroids.keys() if l != k])
-
-                        neg_cents = torch.stack([torch.Tensor(self.centroids[n_l]).to(device) for n_l in neg_label_set])
-                        neg_phis = torch.stack([torch.Tensor([self.phi[n_l]]).to(device) for n_l in neg_label_set])
-                        
-                        #cent_contrast = torch.div(torch.matmul(cur_feature, pos_cent), pos_phi).view(1, -1)
-                        cent_contrast = torch.div(mse_loss(cur_feature, pos_cent), pos_phi).view(1, -1)
-                        norm_contrast = cent_contrast / dim_norm_factor
-                        pos_cent_logit = torch.exp(norm_contrast)
-                        
-                        #negative_cent_loss = torch.div(torch.matmul(cur_feature, neg_cents.T), neg_phis)
-                        negative_cent_loss = torch.stack([torch.div(mse_loss(cur_feature, neg_cents[idx]), neg_phis[idx]) for idx in range(neg_cents.shape[0])])
-                        # 수치 안정성을 위해서
-                        logits = negative_cent_loss / dim_norm_factor
-                        #logits = logits / neg_cents.shape[0]
-
-                        negative_cent_logits = torch.sum(torch.exp(logits))
-
-                        pos_spcl = pos_sub + pos_cent_logit
-                        neg_spcl = neg_sup + negative_cent_logits
-                        
-                        norm_prob = torch.multiply(torch.div(1, positive_num + 1), torch.div(pos_spcl, neg_spcl))
-                        norm_prob = torch.log(norm_prob)
-
-                        total_prob = torch.multiply(-1, norm_prob)
-
-                        loss += total_prob
+                            loss += total_prob
         
 
         norm_loss = torch.div(loss, sample_size)
+        log_loss = torch.log(norm_loss + 1)
 
-        return norm_loss
+        return log_loss
 
 
 class SupConLoss(nn.Module):
