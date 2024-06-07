@@ -1,11 +1,11 @@
 python train.py --dataset_path data/pdnc/novels \
     --save_dir models_storage/cluster/mse_loss \
     --model_state_file model.pth \
-    --latent_dimension 2048 \
     --decoder_hidden 2048 \
+    --latent_dimension 5000 \
     --detach_mems_step 5 \
-    --learning_rate 1e-6 \
-    --weight_decay 0.0 \
+    --learning_rate 2e-6 \
+    --weight_decay 0.1 \
     --seed 201456 \
     --max_epochs 30 \
-    --temperature 0.7
+    --loss_sig 0.5

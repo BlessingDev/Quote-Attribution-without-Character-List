@@ -4,12 +4,11 @@ import torch.functional as F
 import numpy as np
 
 class ProtoSupConLoss(nn.Module):
-    def __init__(self, phi, centroids, temperature=0.7, beta=0.5):
+    def __init__(self, phi, centroids, sig=0.5):
         super(ProtoSupConLoss, self).__init__()
-        self.temperature = temperature
         self.phi = phi
         self.centroids = centroids
-        self.beta = beta
+        self.sig = sig
     
     def forward(self, features, labels):
         device = (torch.device('cuda')
@@ -36,6 +35,10 @@ class ProtoSupConLoss(nn.Module):
         
             label_dicts.append(label_dict)
 
+        # 16, 2
+        mu_pos = 0.8
+        mu_neg = 0.3
+        
         loss = torch.zeros((1, 1)).to(device)
         mse_loss = nn.MSELoss(reduction="sum")
         # for문으로 계산하는 부분을 추후 행렬 곱으로 개선하기를 바람
@@ -51,36 +54,37 @@ class ProtoSupConLoss(nn.Module):
 
                     # 각 레이블에 들어있는 샘플을 순회
                     for i in range(len(batch_dict[k])):
-                        negative_indices = [idx for idx in range(sample_size) if idx != i]
+                        #negative_indices = [idx for idx in range(sample_size) if idx != i]
                         cur_feature = positive_features[i]
                         if len(negative_indices) > 0:
                             # cos 유사도 대신 L2 거리를 사용
                             #negative_loss = torch.div(torch.matmul(cur_feature, negative_features.T), self.temperature).view(1, -1)
-                            negative_loss = torch.stack([torch.div(mse_loss(cur_feature, features[batch_idx, neg_idx]), self.temperature) for neg_idx in negative_indices]).view(1, -1)
+                            negative_loss = torch.stack([mse_loss(cur_feature, features[batch_idx, neg_idx]) for neg_idx in negative_indices]).view(1, -1)
                             # 수치 안정성을 위해서
                             logits = negative_loss / dim_norm_factor
                             #logits = logits / negative_features.shape[0]
 
                             # negative 거리의 영향을 줄이기 위해 평균을 구함
                             # postive 거리의 평균합은 이제 negative 거리의 평균합보다 훨씬 작아져야 함
-                            neg_sup = torch.mean(torch.exp(logits))
+                            neg_x = torch.mean(logits * mu_neg)
+                            neg_sup = neg_x * torch.log(neg_x + torch.e)
                             
-                            pos_sub = [torch.Tensor([0])]
+                            pos_dis = [torch.Tensor([0])]
 
                             for j in range(len(batch_dict[k])):
                                 if i != j:
                                     #anchor_contrast = torch.div(torch.matmul(cur_feature, positive_features[j]), self.temperature)
-                                    anchor_contrast = torch.div(mse_loss(cur_feature, positive_features[j]), self.temperature)
+                                    anchor_contrast = mse_loss(cur_feature, positive_features[j])
                                     norm_contrast = anchor_contrast / dim_norm_factor
 
-                                    pos_logit = torch.exp(norm_contrast)
 
-                                    pos_sub.append(pos_logit)
+                                    pos_dis.append(norm_contrast)
 
-                            if len(pos_sub) > 1:
-                                pos_sub.pop(0)
-                            pos_sub = torch.stack(pos_sub)
-                            norm_pos_sup = torch.mean(pos_sub)
+                            if len(pos_dis) > 1:
+                                pos_dis.pop(0)
+                            pos_dis = torch.stack(pos_dis)
+                            pos_x = torch.mean(pos_dis)
+                            norm_pos_sup = torch.exp(mu_pos * pos_x) - 1
 
                         
                             pos_cent = torch.Tensor(self.centroids[k]).to(device)
@@ -95,7 +99,7 @@ class ProtoSupConLoss(nn.Module):
                             #cent_contrast = torch.div(torch.matmul(cur_feature, pos_cent), pos_phi).view(1, -1)
                             cent_contrast = torch.div(mse_loss(cur_feature, pos_cent), pos_phi).view(1, -1)
                             norm_contrast = cent_contrast / dim_norm_factor
-                            pos_cent_logit = torch.exp(norm_contrast)
+                            pos_cent_logit = torch.exp(mu_pos * norm_contrast) - 1
                             
                             #negative_cent_loss = torch.div(torch.matmul(cur_feature, neg_cents.T), neg_phis)
                             negative_cent_loss = torch.stack([torch.div(mse_loss(cur_feature, neg_cents[idx]), neg_phis[idx]) for idx in range(neg_cents.shape[0])])
@@ -103,23 +107,21 @@ class ProtoSupConLoss(nn.Module):
                             logits = negative_cent_loss / dim_norm_factor
                             #logits = logits / neg_cents.shape[0]
 
-                            negative_cent_logits = torch.mean(torch.exp(logits))
+                            neg_cent_x = torch.mean(logits * mu_neg)
+                            negative_cent_logits = neg_cent_x * torch.log(neg_cent_x + torch.e)
 
-                            pos_spcl = self.beta * norm_pos_sup + (1 - self.beta) * pos_cent_logit
-                            neg_spcl = self.beta * neg_sup + (1 - self.beta) * negative_cent_logits
+                            pos_spcl = self.sig * norm_pos_sup + (1 - self.sig) * pos_cent_logit
+                            neg_spcl = (1 - self.sig) * neg_sup + self.sig * negative_cent_logits
                             
                             #norm_prob = torch.multiply(torch.div(1, positive_num + 1), torch.div(pos_spcl, neg_spcl))
                             #norm_prob = torch.log(norm_prob)
 
-                            total_prob = torch.div(pos_spcl, neg_spcl)
+                            total_prob = torch.div(pos_spcl + 5, neg_spcl)
 
-                            loss += total_prob
-        
+                            loss += torch.log(total_prob + 1)
 
         norm_loss = torch.div(loss, sample_size)
-        log_loss = torch.log(norm_loss + 1)
-
-        return log_loss
+        return norm_loss
 
 
 class SupConLoss(nn.Module):

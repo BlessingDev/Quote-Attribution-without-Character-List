@@ -50,7 +50,7 @@ def handle_dirs(dirpath):
 def make_train_state(args):
     return {'stop_early': False,
             'early_stopping_step': 0,
-            'early_stopping_best_val': 1e8,
+            'early_stopping_best_val': 0,
             'learning_rate': args.learning_rate,
             'epoch_index': 0,
             'train_loss': [],
@@ -88,11 +88,11 @@ def update_train_state(args, model, train_state):
 
     # 성능이 향상되면 모델을 저장합니다
     elif train_state['epoch_index'] >= 1:
-        loss_tm1, loss_t = train_state['val_loss'][-2:]
-        loss_tolerance = 0.001
+        acc_tm1, acc_t = train_state['val_acc'][-2:]
+        loss_tolerance = 0
          
         # 손실이 나빠지면
-        if loss_t >= loss_tm1 - loss_tolerance:
+        if acc_t <= acc_tm1 - loss_tolerance:
             # 조기 종료 단계 업데이트
             train_state['early_stopping_step'] += 1
             print()
@@ -104,9 +104,9 @@ def update_train_state(args, model, train_state):
             train_state['early_stopping_step'] = 0
         
         # 최상의 모델 저장
-        if loss_t < train_state['early_stopping_best_val']:
+        if acc_t > train_state['early_stopping_best_val']:
             torch.save(model.state_dict(), train_state['model_filename'])
-            train_state['early_stopping_best_val'] = loss_t
+            train_state['early_stopping_best_val'] = acc_t
 
 
         # 조기 종료 여부 확인
@@ -226,48 +226,59 @@ def calc_cluster_phi(
 
     is_cluster_assigned = [False] * len(label_set)
     for l, l_num in num_label_list:
-        indices = [i for i, j in enumerate(labels) if j == l]
-        cluster_result = km.labels_[indices]
-        cluster_count = Counter(cluster_result)
-        
-        cluster_counter_list = [(k, v) for k, v in cluster_count.items()]
-        cluster_counter_list.sort(key=lambda x: x[1], reverse=True)
+        # narrative는 centroid와 phi를 할당하지 않음
+        if l != '':
+            indices = [i for i, j in enumerate(labels) if j == l]
+            cluster_result = km.labels_[indices]
+            cluster_count = Counter(cluster_result)
+            
+            cluster_counter_list = [(k, v) for k, v in cluster_count.items()]
+            cluster_counter_list.sort(key=lambda x: x[1], reverse=True)
 
-        assigned_cluster = -1
-        idx = 0
-        while assigned_cluster == -1 and idx < len(cluster_counter_list):
-            c_idx, cluster_count = cluster_counter_list[idx]
-            if not is_cluster_assigned[c_idx]:
-                assigned_cluster = c_idx
+            assigned_cluster = -1
+            idx = 0
+            while assigned_cluster == -1 and idx < len(cluster_counter_list):
+                c_idx, cluster_count = cluster_counter_list[idx]
+                if not is_cluster_assigned[c_idx]:
+                    assigned_cluster = c_idx
+                    is_cluster_assigned[assigned_cluster] = True
+                
+                idx += 1
+
+            # 못 찾았을 때
+            # 남은 centroid 중 가장 가까운 것을 할당
+            if assigned_cluster == -1:
+                avg_point = np.average(features[indices].reshape((len(indices), -1)), axis=0, keepdims=True)
+                
+                # bool 인덱싱
+                unassigned_centroids = km.cluster_centers_[[not b for b in is_cluster_assigned]]
+                unassigned_centroids_idx = [i for i, b in enumerate(is_cluster_assigned) if b == False]
+                norms = np.linalg.norm((avg_point - unassigned_centroids).reshape((len(unassigned_centroids_idx), -1)), axis=1)
+
+                min_idx = np.argmin(norms)
+                assigned_cluster = unassigned_centroids_idx[min_idx]
                 is_cluster_assigned[assigned_cluster] = True
-            
-            idx += 1
-
-        # 못 찾았을 때
-        # 남은 centroid 중 가장 가까운 것을 할당
-        if assigned_cluster == -1:
-            avg_point = np.average(features[indices].reshape((len(indices), -1)), axis=0, keepdims=True)
-            
-            # bool 인덱싱
-            unassigned_centroids = km.cluster_centers_[[not b for b in is_cluster_assigned]]
-            unassigned_centroids_idx = [i for i, b in enumerate(is_cluster_assigned) if b == False]
-            norms = np.linalg.norm((avg_point - unassigned_centroids).reshape((len(unassigned_centroids_idx), -1)), axis=1)
-
-            min_idx = np.argmin(norms)
-            assigned_cluster = unassigned_centroids_idx[min_idx]
-            is_cluster_assigned[assigned_cluster] = True
 
 
-        centroids[l] = km.cluster_centers_[assigned_cluster]
+            centroids[l] = km.cluster_centers_[assigned_cluster]
 
-        norms = np.linalg.norm(features[indices] - centroids[l], axis=1, keepdims=True)
-        norm_sum = np.sum(norms)
+            norms = np.linalg.norm(features[indices] - centroids[l], axis=1, keepdims=True)
+            norm_sum = np.sum(norms)
 
-        low = l_num * np.log(l_num + alpha)
+            #low = l_num * np.log(l_num + alpha)
+            #phi[l] = norm_sum / l_num
 
-        phi[l] = norm_sum / low
-        if phi[l] == 0:
-            phi[l] = 0.2
+            if norm_sum == 0:
+                phi[l] = 1.0
+            else:
+                phi[l] = norm_sum / l_num
+    
+    # phi를 정규화
+    phi_list = [phi[k] for k in phi.keys()]
+    phi_max = max(phi_list)
+    phi_min = min(phi_list)
+    for k in phi.keys():
+        phi[k] = (phi_max - phi[k] + alpha) / (phi_max - phi_min + alpha)
 
     fig = None
     if return_fig:
@@ -328,13 +339,15 @@ def train_model(args, data_set, model):
                                             mode='min', factor=0.5,
                                             patience=1)
 
+    max_grad_norm = 3.
+    torch.nn.utils.clip_grad.clip_grad_norm_(model.parameters(), max_grad_norm)
+    
     epoch_bar = tqdm.tqdm(desc='training routine', 
                                 total=args.max_epochs,
                                 position=0)
-
     
 
-    is_linux = platform.system() == "Linux"
+    #is_linux = platform.system() == "Linux"
     
     time_str = datetime.datetime.now().strftime("%Y-%m-%d_%H_%M")
     tf_writer = SummaryWriter(log_dir=os.path.join(args.log_dir, "exp_{0}".format(time_str)), comment="Infini-BERT-speaker-cluster")
@@ -347,7 +360,7 @@ def train_model(args, data_set, model):
         "seed": args.seed,
         "saved_anchor": args.saved_anchor_num,
         "detach_mem_stemp": args.detach_mems_step,
-        "loss_temperature": args.temperature,
+        "loss_sigma": args.loss_sig
     }
 
 
@@ -371,7 +384,7 @@ def train_model(args, data_set, model):
                 3, 8, 12, 17
             ]
             test_books = [
-                18, 19, 20
+                18, 19, 20, 21
             ]
             book_bar = tqdm.tqdm(desc='books', 
                                 total=len(train_books),
@@ -473,7 +486,7 @@ def train_model(args, data_set, model):
                 loss = torch.zeros((1, 1)).to(device)
                 # 단계 1. 그레이디언트를 0으로 초기화합니다
                 optimizer.zero_grad()
-                cluster_loss = ProtoSupConLoss(cluster_phi, centroids, args.temperature)
+                cluster_loss = ProtoSupConLoss(cluster_phi, centroids, sig=args.loss_sig)
                 
                 cls_features = []
                 speakers = []
@@ -526,9 +539,13 @@ def train_model(args, data_set, model):
                     
                     anchor_info = update_anchor(anchor_info, args.saved_anchor_num, batch_dict, y_pred[0])
                     
-                    loss += cur_loss
-                    # 이동 손실과 이동 정확도를 계산합니다
-                    running_loss += (cur_loss.item() - running_loss) / (batch_index + 1)
+                    if not torch.isinf(cur_loss).item():
+                        loss += cur_loss
+                        # 이동 손실과 이동 정확도를 계산합니다
+                        running_loss += (cur_loss.item() - running_loss) / (batch_index + 1)
+                    else:
+                        tf_writer.add_text(tag="book{0}/train/log".format(book), text_string="Inf occured", global_step=epoch_index)
+                    
                     tf_writer.add_scalar(tag="book{0}/train/step_loss".format(book), scalar_value=cur_loss, global_step=(epoch_index) * paragraph_num + batch_index)
                     
                     #acc_t = None
@@ -687,7 +704,7 @@ def train_model(args, data_set, model):
                 cls_features = []
                 speakers = []
 
-                cluster_loss = ProtoSupConLoss(cluster_phi, centroids, args.temperature)
+                cluster_loss = ProtoSupConLoss(cluster_phi, centroids, sig=args.loss_sig)
 
                 for batch_index, batch_dict in enumerate(batch_generator):
                     acu_paragraph_num += len(batch_dict["x_length"]) 
@@ -757,7 +774,7 @@ def train_model(args, data_set, model):
                 book_bar.set_postfix(loss=running_loss, v1=running_v1)
                 book_bar.update()
 
-                tf_writer.add_scalar(tag="book{0}/val/loss".format(book), scalar_value=running_loss, global_step=epoch_index)
+                tf_writer.add_scalar(tag="book{0}/val/loss".format(book), scalar_value=book_loss, global_step=epoch_index)
                 #train_state['val_acc'].append(running_acc)
 
                 tf_writer.flush()
@@ -897,10 +914,10 @@ def main():
         default=2,
         type=int
     )
-
+    
     parser.add_argument(
-        "--temperature",
-        default=0.7,
+        "--loss_sig",
+        default=0.5,
         type=float
     )
 
@@ -948,15 +965,14 @@ def main():
         "--dataset_path", "data/pdnc/novels",
         "--save_dir", "models_storage/test",
         "--model_state_file", "model.pth",
-        "--latent_dimension", "1024",
-        "--decoder_hidden", "4096",
+        "--latent_dimension", "2048",
+        "--decoder_hidden", "2048",
         "--saved_anchor_num", "3",
         "--detach_mems_step", "5",
-        "--learning_rate", "1e-5",
+        "--learning_rate", "2e-6",
         "--weight_decay", "0.1",
         "--seed", "201456",
-        "--temperature", "0.7",
-        "--test", "True",
+        "--test", "",
     ])'''
 
     args = parser.parse_args()

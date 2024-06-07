@@ -14,12 +14,20 @@ class SpeakerClusterModel(nn.Module):
         self.infini_bert = InfiniBertModel.from_pretrained("bert-base-uncased", config=config, add_pooling_layer=False)
         self.config = self.infini_bert.config
         
-        self.decoder = nn.Sequential(
-            nn.Linear(config.hidden_size, config.decoder_intermediate_size),
+        self.initial_presentation = nn.Linear(config.hidden_size, config.decoder_intermediate_size)
+        
+        self.decoder_hidden = nn.Sequential(
+            nn.Linear(config.decoder_intermediate_size, config.decoder_intermediate_size),
             nn.ELU(),
-            nn.Dropout(p=0.3),
-            nn.Linear(config.decoder_intermediate_size, config.feature_dimension)
+            nn.Dropout(p=0.5),
+            nn.Linear(config.decoder_intermediate_size, config.decoder_intermediate_size)
         )
+        self.decoder = nn.Sequential(
+            nn.Linear(config.decoder_intermediate_size, config.feature_dimension),
+            nn.Tanh()
+        )
+        
+        self.norm_shape = []
     
     def forward(
         self, 
@@ -57,7 +65,12 @@ class SpeakerClusterModel(nn.Module):
         
         last_hidden = encoder_output.last_hidden_state
         
-        latent_features = self.decoder(last_hidden)
+        initial_hidden = self.initial_presentation(last_hidden)
+        latent_hidden = self.decoder_hidden(initial_hidden)
+        norm_hidden = nn.LayerNorm(initial_hidden.shape[1:], device=latent_hidden.device)(latent_hidden)
+        norm_hidden = norm_hidden + initial_hidden
+        
+        latent_features = self.decoder(norm_hidden)
         
         return (latent_features), encoder_output
 

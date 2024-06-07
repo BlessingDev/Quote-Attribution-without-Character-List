@@ -144,7 +144,7 @@ def plot_hdbs_cluster(hdbs, features, labels):
     sns.set_style("darkgrid")
     fig = plt.figure(figsize=(16,9), dpi=300)
     ax = fig.add_subplot()
-    label_cmap = ListedColormap(sns.color_palette("tab10", n_colors=len(label_set)).as_hex())
+    label_cmap = ListedColormap(sns.color_palette("terrain", n_colors=len(label_set)).as_hex())
     label_list = sorted(list(label_set))
     
     for l in label_list:
