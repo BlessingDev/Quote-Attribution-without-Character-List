@@ -2,10 +2,12 @@ python train.py --dataset_path data/pdnc/novels \
     --save_dir models_storage/cluster/mse_loss \
     --model_state_file model.pth \
     --decoder_hidden 2048 \
-    --latent_dimension 5000 \
+    --feature_dimension 5000 \
+    --feature_freedom 5 \
     --detach_mems_step 5 \
     --learning_rate 2e-6 \
     --weight_decay 0.1 \
     --seed 201456 \
-    --max_epochs 30 \
+    --max_epochs 15 \
+    --book_train_iter 2 \
     --loss_sig 0.5

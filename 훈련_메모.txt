@@ -134,14 +134,46 @@ loss에 대한 분석도 필요하다.
 - 성능 잘 안 나옴. 오히려 0606_2118보다 못한 모습 보임
 - 자유도를 늘렸음에도 언더피팅. loss 최적화가 왜 안 되는지 이유 분석 필요
 
-0607_1300
+0607_1535
 - 멀리 있는 postive를 빠르게 끌어오도록 mu_p를 크게, 가까이 있는 negative를 더 열심히 밀어내도록 mu_n을 작게 설정 (0.8, 0.3)
+- loss가 줄어들지 않는 현상을 고치기 위해 lr 증가
+- 최적화를 위해 단일 책 최적화를 n회씩 진행하는 기법 (n에폭씩 묶어서 에폭을 진행)
+- 성능 여전히 안 좋음. 최적화 안 됨.
+
+0607_1754
+- lr 더 증가
+- mu_p와 mu_n을 이전 가장 좋았던 값인 0.15와 0.2로 변경
+    - tanh에 자유도를 추가. 5로 설정
+- 성능 너무 나쁨
+
+0608_1214
+- mse_loss의 reduction을 기존 sum에서 mean으로 변경.
+    - 그에 따라 수의 규모가 줄어드니 mu_p를 1.0으로 변경
+    - mu_n도 0.8로 변경
+    - tanh 활성 제거
+- 성능이 매우 나쁨
+- 단순 성능 비교를 위해 여기서부터 파라미터를 하나씩 바꾸며 실험 진행
+
+0608_2203
+- 위 설정에서 mu_p가 미치는 영향을 파악하기 위해 mu_p만 0.5로 줄임
+- 안 좋은 성능
+
+
+0610_1138
+- 위 설정에서 mu_n이 미치는 영향을 파악하기 위해 mu_p를 1.0으로 mu_n을 0.5로 설정
+- tanh 활성 추가
+- 첫 에폭에서 발화자 비율 파이 차트 그리기
+- 매 반복마다 평균 pos 거리, 평균 neg 거리 기록. 도표 그리기.
+- 군집화 평가를 Fowlkes-Mallows Score로 진행
+
+0612_
 
 추후
-최적화를 위해 단일 책 최적화를 n회씩 진행하는 기법 (n에폭씩 묶어서 에폭을 진행)
+여타 prototypical classification 연구 탐색 (Gram matrix)
+GRU 도입하여 순차적 정보 고려
+
 domain incremental 고려 (여러 권의 책으로 batch 구성)
 class imbalance 문제 고려
-여타 prototypical classification 연구 탐색 (Gram matrix)
 
 tensorboard --logdir="/workspace/models_storage/cluster/mse_loss/log" --bind_all
 

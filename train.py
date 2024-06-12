@@ -7,12 +7,6 @@ from typing import Tuple
 from collections import Counter
 
 from sklearn.cluster import KMeans
-from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA
-
-import matplotlib.pyplot as plt
-from matplotlib.colors import ListedColormap
-import seaborn as sns
 
 import torch
 import torch.optim as optim
@@ -31,6 +25,8 @@ from transformers import (
 import random
 import metric
 import gc
+
+import visualize
 
 # gpu 번호 지정
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
@@ -124,7 +120,8 @@ def init_model_and_dataset(args:Namespace) -> Tuple[PDNCDataset, BertTokenizer, 
 
     bert_config = BertConfig.from_pretrained("bert-base-uncased")
     bert_config.decoder_intermediate_size = args.decoder_hidden
-    bert_config.feature_dimension = args.latent_dimension
+    bert_config.feature_dimension = args.feature_dimension
+    bert_config.feature_freedom = args.feature_freedom
     
     model = SpeakerClusterModel(bert_config)
 
@@ -284,37 +281,7 @@ def calc_cluster_phi(
     if return_fig:
         # 구한 centroid와 phi를 저장해두자
         # fig를 그리기에 앞서 PCA를 통해 차원 축소 수행
-        norm_x = StandardScaler().fit_transform(features)
-        pca = PCA(n_components=3)
-        principal_component = pca.fit_transform(norm_x)
-        principal_df = pd.DataFrame(data=principal_component, columns = ['component1', 'component2', 'component3'])
-        principal_df["labels"] = labels
-        explained_ratio = sum(pca.explained_variance_ratio_)
-
-        sns.set_style("darkgrid")
-        fig = plt.figure(figsize=(16,9), dpi=300)
-        ax = fig.add_subplot(projection='3d')
-        cmap = ListedColormap(sns.color_palette("Set2", n_colors=len(label_set)).as_hex())
-        label_list = sorted(list(label_set))
-        for l in label_list:
-            l_df = principal_df.loc[principal_df["labels"] == l]
-            
-            display_label = l
-            if l == '':
-                display_label = "narrative"
-            
-            sc = ax.scatter(
-                l_df["component1"],
-                l_df["component2"],
-                l_df["component3"],
-                c=cmap.colors[label_to_idx[l]],
-                label=display_label,
-                alpha=0.2
-            )
-
-        ax.set_title("3D Scatter (PCA Exp. Rate={0})".format(round(explained_ratio, 2)))
-        ax.legend(loc='center left', bbox_to_anchor=(1, 0.5))
-        ax.grid(True)
+        fig = visualize.plot_scatter_fig(features, labels)
 
     #plt.savefig("scatter_hue", bbox_inches='tight')
         
@@ -353,7 +320,7 @@ def train_model(args, data_set, model):
     tf_writer = SummaryWriter(log_dir=os.path.join(args.log_dir, "exp_{0}".format(time_str)), comment="Infini-BERT-speaker-cluster")
 
     hparam_dict={
-        "laten_dimension": args.latent_dimension,
+        "feature_dimension": args.feature_dimension,
         "decoder_hidden": args.decoder_hidden,
         "lr": args.learning_rate,
         "weight decay": args.weight_decay,
@@ -390,208 +357,297 @@ def train_model(args, data_set, model):
                                 total=len(train_books),
                                 position=1)
             random.shuffle(train_books)
+
             for book in train_books:
                 # 훈련 세트와 배치 제너레이터 준비, 손실과 정확도를 0으로 설정
                 data_set.set_book(book)
                 train_bar = tqdm.tqdm(desc='book{0} momentum'.format(book),
-                                            total=data_set.get_num_batches(1), 
-                                            position=2, 
-                                            leave=True)
+                                      total=data_set.get_num_batches(1),
+                                      position=2,
+                                      leave=True)
                 batch_generator = generate_pdnc_batches(data_set,
-                                                    max_seq_length=tokenizer.model_max_length,
-                                                    device=device)
+                                                        max_seq_length=tokenizer.model_max_length,
+                                                        device=device)
 
                 cls_features = []
                 speakers = []
                 model.init_memories()
                 model.eval()
 
+                cur_title = data_set.get_cur_title()
+
                 # momentum을 얻는다.
                 # 의사적인 centroid를 얻는다.
                 # 군집 밀집도 phi를 얻는다.
                 for batch_index, batch_dict in enumerate(batch_generator):
-                    should_detach_memories = ((batch_index + 1) % args.detach_mems_step == 0)
+                    should_detach_memories = (
+                        (batch_index + 1) % args.detach_mems_step == 0)
                     seq_length = np.sum(batch_dict["x_length"])
                     if seq_length > tokenizer.model_max_length:
                         # 문단 길이가 context window를 초과할 때
                         # 문단에서 발화자가 달라지지 않고 전체가 다 한 사람이 말한 것이거나 설명문이거나
                         # 여러 번 출력을 받아 pooling하는 방식으로 해결
-                        process_num = (seq_length // tokenizer.model_max_length) + 1
-                        avg_pool = nn.AvgPool2d(kernel_size=(process_num, 1), stride=1)
+                        process_num = (
+                            seq_length // tokenizer.model_max_length) + 1
+                        avg_pool = nn.AvgPool2d(
+                            kernel_size=(process_num, 1), stride=1)
                         pred_features = []
                         error_accum = 0
                         
                         for i in range(process_num):
-                            x_i = batch_dict['x'][0][i * tokenizer.model_max_length - error_accum: min(seq_length, (i + 1) * tokenizer.model_max_length) - error_accum].reshape((1, -1))
+                            x_i = batch_dict['x'][0][i * tokenizer.model_max_length - error_accum: min(
+                                seq_length, (i + 1) * tokenizer.model_max_length) - error_accum].reshape((1, -1))
                             if x_i[0][0] != tokenizer.cls_token_id:
-                                x_i = batch_dict['x'][0][i * tokenizer.model_max_length - error_accum: min(seq_length, (i + 1) * tokenizer.model_max_length - 1) - error_accum].reshape((1, -1))
-                                x_i = torch.cat((torch.tensor([[tokenizer.cls_token_id]]).to(device), x_i), dim=1)
+                                x_i = batch_dict['x'][0][i * tokenizer.model_max_length - error_accum: min(
+                                    seq_length, (i + 1) * tokenizer.model_max_length - 1) - error_accum].reshape((1, -1))
+                                x_i = torch.cat(
+                                    (torch.tensor([[tokenizer.cls_token_id]]).to(device), x_i), dim=1)
                                 error_accum += 1
-                            
+
                             pred = model(x_i)
                             pred_features.append(pred[0][0][0])
-                        
-                        pred_features = torch.cat(pred_features, dim=0).reshape((1, process_num, pred_features[0].shape[0]))
+
+                        pred_features = torch.cat(pred_features, dim=0).reshape(
+                            (1, process_num, pred_features[0].shape[0]))
                         y_pred = avg_pool(pred_features)
-                        
+
                         y_pred = (y_pred, None)
                     else:
                         y_pred = model(batch_dict['x'])
-                    
+
                     cls_features.extend([feature.detach().cpu().numpy() for feature in y_pred[0][0][batch_dict["cls_index"]]])
                     speakers.extend(batch_dict["speaker"])
 
+                        # 진행 상태 막대 업데이트
+                    train_bar.update(len(batch_dict["speaker"]))
+                    if should_detach_memories:
+                        model.detach_memories_()
+
+                cluster_phi, centroids, _ = calc_cluster_phi(np.array(cls_features), speakers)
+                
+                if epoch_index == 0:
+                    fig = visualize.plot_speaker_pie(speakers, cur_title)
+                    tf_writer.add_figure(tag="book{0}/train/speaker_pie".format(book), figure=fig, global_step=epoch_index)
+                
+                model.train()
+                iter_loss = []
+                log_distance = True
+                cluster_loss = ProtoSupConLoss(cluster_phi, centroids, sig=args.loss_sig, save_dis=log_distance)
+                
+                for book_iter_idx in range(args.book_train_iter):
+                    data_set.set_book(book)
+                    train_bar = tqdm.tqdm(desc='book{0}-{1}'.format(book, book_iter_idx),
+                                                total=data_set.get_num_batches(1), 
+                                                position=2, 
+                                                leave=True)
+                    batch_generator = generate_pdnc_batches(data_set,
+                                                        max_seq_length=tokenizer.model_max_length,
+                                                        device=device)
                     
-                    # 진행 상태 막대 업데이트
+                    running_loss = 0.0
+                    model.init_memories()
+                    
+                    # 앵커로 저장해둔 특징 벡터와 레이블 리스트
+                    anchor_info = dict()
+                    
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    
+                    paragraph_num = data_set.get_num_batches(1)
+                    acu_paragraph_num = 0
+                    loss = torch.zeros((1, 1)).to(device)
+                    # 단계 1. 그레이디언트를 0으로 초기화합니다
+                    optimizer.zero_grad()
+                    pos_dis_dict = {s: [] for s in cluster_phi.keys()}
+                    neg_dis_dict = {s: [] for s in cluster_phi.keys()}
+                    
+                    for batch_index, batch_dict in enumerate(batch_generator):
+                        
+                        # 현재 스텝에서 역전파해야하는지 확인
+                        acu_paragraph_num += len(batch_dict["x_length"]) 
+                        is_last = (acu_paragraph_num == paragraph_num)
+                        should_detach_memories = ((batch_index + 1) % args.detach_mems_step == 0)
+                        should_backward = (is_last or should_detach_memories)
+                            
+                        # 훈련 과정은 5단계로 이루어집니다
+
+                        # --------------------------------------
+
+                        # 단계 2. 출력을 계산합니다
+                        seq_length = np.sum(batch_dict["x_length"])
+                        if seq_length > tokenizer.model_max_length:
+                            # 문단 길이가 context window를 초과할 때
+                            # 문단에서 발화자가 달라지지 않고 전체가 다 한 사람이 말한 것이거나 설명문이거나
+                            # 여러 번 출력을 받아 pooling하는 방식으로 해결
+                            process_num = (seq_length // tokenizer.model_max_length) + 1
+                            avg_pool = nn.AvgPool2d(kernel_size=(process_num, 1), stride=1)
+                            pred_features = []
+                            error_accum = 0
+                            
+                            for i in range(process_num):
+                                x_i = batch_dict['x'][0][i * tokenizer.model_max_length - error_accum: min(seq_length, (i + 1) * tokenizer.model_max_length) - error_accum].reshape((1, -1))
+                                if x_i[0][0] != tokenizer.cls_token_id:
+                                    x_i = batch_dict['x'][0][i * tokenizer.model_max_length - error_accum: min(seq_length, (i + 1) * tokenizer.model_max_length - 1) - error_accum].reshape((1, -1))
+                                    x_i = torch.cat((torch.tensor([[tokenizer.cls_token_id]]).to(device), x_i), dim=1)
+                                    error_accum += 1
+                                
+                                pred = model(x_i)
+                                pred_features.append(pred[0][0][0])
+                            
+                            pred_features = torch.cat(pred_features, dim=0).reshape((1, process_num, pred_features[0].shape[0]))
+                            y_pred = avg_pool(pred_features)
+                            
+                            y_pred = (y_pred, None)
+                        else:
+                            y_pred = model(batch_dict['x'])
+                        
+                        # 현재 데이터에 앵커를 추가한 feature, label 리스트를 얻는다.
+                        features, labels = concat_saved_anchors(anchor_info, batch_dict, y_pred[0])
+                        
+                        # 단계 3. 손실을 계산합니다
+                        cur_loss, step_pos_dis, step_neg_dis = cluster_loss(features, [labels])
+                        
+                        anchor_info = update_anchor(anchor_info, args.saved_anchor_num, batch_dict, y_pred[0])
+                        
+                        if not torch.isinf(cur_loss).item():
+                            loss += cur_loss
+                            # 이동 손실과 이동 정확도를 계산합니다
+                            running_loss += (cur_loss.item() - running_loss) / (batch_index + 1)
+                        else:
+                            tf_writer.add_text(tag="book{0}/train/log".format(book), text_string="Inf occured", global_step=epoch_index)
+                        
+                        tf_writer.add_scalar(tag="book{0}/train/step_loss".format(book), scalar_value=cur_loss, global_step=(epoch_index * args.book_train_iter + book_iter_idx) * paragraph_num + batch_index)
+                        
+                        
+                        if log_distance:
+                            for s in step_pos_dis.keys():
+                                pos_dis_dict[s].append(np.mean(step_pos_dis[s]))
+                                neg_dis_dict[s].append(np.mean(step_neg_dis[s]))
+                        
+                        
+                        #acc_t = None
+                        #running_acc += (acc_t - running_acc) / (batch_index + 1)
+                        
+                        if should_backward:
+                            # 특정 스텝 수마다 backward 수행. 그런 후에 detach하여 메모리 초기화
+                            # 단계 4. 손실을 사용해 그레이디언트를 계산합니다
+                            nan = torch.isnan(loss)
+                            inf = torch.isinf(loss)
+                            grad_fn = loss.grad_fn is not None
+                            if not nan and not inf and grad_fn:
+                                loss.backward()
+
+                                # 단계 5. 옵티마이저로 가중치를 업데이트합니다
+                                optimizer.step()
+                            else:
+                                if nan:
+                                    tf_writer.add_text(tag="book{0}/train/log".format(book), text_string="NAN occured", global_step=epoch_index)
+                                if grad_fn:
+                                    tf_writer.add_text(tag="book{0}/train/log".format(book), text_string="gradient is empty", global_step=epoch_index)
+                            
+                            loss = torch.zeros((1, 1)).to(device)
+                            
+                            
+                            # 메모리를 분리하여 계속 사용 가능하도록 함
+                            model.detach_memories_()
+                            del anchor_info
+                            anchor_info = dict()
+                            
+                            # 단계 1. 그레이디언트를 0으로 초기화합니다
+                            optimizer.zero_grad()
+                        # -----------------------------------------
+
+                        
+                        # 진행 상태 막대 업데이트
+                        train_bar.set_postfix(loss=running_loss)
+                        train_bar.update(len(batch_dict["speaker"]))
+                    
+                    iter_loss.append(running_loss)
+                    
+                    if log_distance:
+                        for s in pos_dis_dict.keys():
+                            tf_writer.add_scalar(tag="book{0}/train/step_{1}_pos_dis".format(book, s), scalar_value=np.mean(pos_dis_dict[s]), global_step=(epoch_index * args.book_train_iter + book_iter_idx))
+                            tf_writer.add_scalar(tag="book{0}/train/step_{1}_neg_dis".format(book, s), scalar_value=np.mean(neg_dis_dict[s]), global_step=(epoch_index * args.book_train_iter + book_iter_idx))
+
+                # -----------------------------------------------------
+                # book iter 훈련 종료
+                
+                data_set.set_book(book)
+                train_bar = tqdm.tqdm(desc='book{0} momentum'.format(book),
+                                      total=data_set.get_num_batches(1),
+                                      position=2,
+                                      leave=True)
+                batch_generator = generate_pdnc_batches(data_set,
+                                                        max_seq_length=tokenizer.model_max_length,
+                                                        device=device)
+
+                cls_features = []
+                speakers = []
+                model.init_memories()
+                model.eval()
+                
+
+                # 최적화 결과로 얻은 군집을 평가
+                for batch_index, batch_dict in enumerate(batch_generator):
+                    should_detach_memories = (
+                        (batch_index + 1) % args.detach_mems_step == 0)
+                    seq_length = np.sum(batch_dict["x_length"])
+                    if seq_length > tokenizer.model_max_length:
+                        # 문단 길이가 context window를 초과할 때
+                        # 문단에서 발화자가 달라지지 않고 전체가 다 한 사람이 말한 것이거나 설명문이거나
+                        # 여러 번 출력을 받아 pooling하는 방식으로 해결
+                        process_num = (
+                            seq_length // tokenizer.model_max_length) + 1
+                        avg_pool = nn.AvgPool2d(
+                            kernel_size=(process_num, 1), stride=1)
+                        pred_features = []
+                        error_accum = 0
+                        
+                        for i in range(process_num):
+                            x_i = batch_dict['x'][0][i * tokenizer.model_max_length - error_accum: min(
+                                seq_length, (i + 1) * tokenizer.model_max_length) - error_accum].reshape((1, -1))
+                            if x_i[0][0] != tokenizer.cls_token_id:
+                                x_i = batch_dict['x'][0][i * tokenizer.model_max_length - error_accum: min(
+                                    seq_length, (i + 1) * tokenizer.model_max_length - 1) - error_accum].reshape((1, -1))
+                                x_i = torch.cat(
+                                    (torch.tensor([[tokenizer.cls_token_id]]).to(device), x_i), dim=1)
+                                error_accum += 1
+
+                            pred = model(x_i)
+                            pred_features.append(pred[0][0][0])
+
+                        pred_features = torch.cat(pred_features, dim=0).reshape(
+                            (1, process_num, pred_features[0].shape[0]))
+                        y_pred = avg_pool(pred_features)
+
+                        y_pred = (y_pred, None)
+                    else:
+                        y_pred = model(batch_dict['x'])
+
+                    cls_features.extend([feature.detach().cpu().numpy() for feature in y_pred[0][0][batch_dict["cls_index"]]])
+                    speakers.extend(batch_dict["speaker"])
+
+                        # 진행 상태 막대 업데이트
                     train_bar.update(len(batch_dict["speaker"]))
                     if should_detach_memories:
                         model.detach_memories_()
                 
-                cluster_phi, centroids, fig = calc_cluster_phi(np.array(cls_features), speakers)
-                '''tf_writer.add_figure(
-                    tag="book{0}/train/scatter".format(book), 
-                    figure=fig,
-                    global_step=epoch_index
-                )'''
-                
+                iter_loss = np.mean(iter_loss)
+
                 if not args.test:
-                    homo, comp, v1, fig = metric.calc_v_measure_with_hdb(labels=speakers, features=np.array(cls_features))
-                    tf_writer.add_scalar(tag="book{0}/train/v1".format(book), scalar_value=v1, global_step=epoch_index)
-                    tf_writer.add_scalar(tag="book{0}/train/homogeneity".format(book), scalar_value=homo, global_step=epoch_index)
-                    tf_writer.add_scalar(tag="book{0}/train/completeness".format(book), scalar_value=comp, global_step=epoch_index)
+                    FM_score, _ = metric.calc_FM_score_with_hdb(labels=speakers, features=np.array(cls_features), draw_fig=False)
+                    tf_writer.add_scalar(tag="book{0}/train/FM score".format(book), scalar_value=FM_score, global_step=epoch_index)
+                    #tf_writer.add_scalar(tag="book{0}/train/homogeneity".format(book), scalar_value=homo, global_step=epoch_index)
+                    #tf_writer.add_scalar(tag="book{0}/train/completeness".format(book), scalar_value=comp, global_step=epoch_index)
                     
-                    tf_writer.add_figure(tag="book{0}/train/cluster result".format(book), figure=fig, global_step=epoch_index)
-
-                data_set.set_book(book)
-                train_bar = tqdm.tqdm(desc='book{0}'.format(book),
-                                            total=data_set.get_num_batches(1), 
-                                            position=2, 
-                                            leave=True)
-                batch_generator = generate_pdnc_batches(data_set,
-                                                    max_seq_length=tokenizer.model_max_length,
-                                                    device=device)
+                    #tf_writer.add_figure(tag="book{0}/train/cluster result".format(book), figure=fig, global_step=epoch_index)
                 
-                running_loss = 0.0
-                model.init_memories()
-                model.train()
-                
-                # 앵커로 저장해둔 특징 벡터와 레이블 리스트
-                anchor_info = dict()
-                
-                gc.collect()
-                torch.cuda.empty_cache()
-                
-                paragraph_num = data_set.get_num_batches(1)
-                acu_paragraph_num = 0
-                loss = torch.zeros((1, 1)).to(device)
-                # 단계 1. 그레이디언트를 0으로 초기화합니다
-                optimizer.zero_grad()
-                cluster_loss = ProtoSupConLoss(cluster_phi, centroids, sig=args.loss_sig)
-                
-                cls_features = []
-                speakers = []
-
-                for batch_index, batch_dict in enumerate(batch_generator):
-                    
-                    # 현재 스텝에서 역전파해야하는지 확인
-                    acu_paragraph_num += len(batch_dict["x_length"]) 
-                    is_last = (acu_paragraph_num == paragraph_num)
-                    should_detach_memories = ((batch_index + 1) % args.detach_mems_step == 0)
-                    should_backward = (is_last or should_detach_memories)
-                        
-                    # 훈련 과정은 5단계로 이루어집니다
-
-                    # --------------------------------------
-
-                    # 단계 2. 출력을 계산합니다
-                    seq_length = np.sum(batch_dict["x_length"])
-                    if seq_length > tokenizer.model_max_length:
-                        # 문단 길이가 context window를 초과할 때
-                        # 문단에서 발화자가 달라지지 않고 전체가 다 한 사람이 말한 것이거나 설명문이거나
-                        # 여러 번 출력을 받아 pooling하는 방식으로 해결
-                        process_num = (seq_length // tokenizer.model_max_length) + 1
-                        avg_pool = nn.AvgPool2d(kernel_size=(process_num, 1), stride=1)
-                        pred_features = []
-                        error_accum = 0
-                        
-                        for i in range(process_num):
-                            x_i = batch_dict['x'][0][i * tokenizer.model_max_length - error_accum: min(seq_length, (i + 1) * tokenizer.model_max_length) - error_accum].reshape((1, -1))
-                            if x_i[0][0] != tokenizer.cls_token_id:
-                                x_i = batch_dict['x'][0][i * tokenizer.model_max_length - error_accum: min(seq_length, (i + 1) * tokenizer.model_max_length - 1) - error_accum].reshape((1, -1))
-                                x_i = torch.cat((torch.tensor([[tokenizer.cls_token_id]]).to(device), x_i), dim=1)
-                                error_accum += 1
-                            
-                            pred = model(x_i)
-                            pred_features.append(pred[0][0][0])
-                        
-                        pred_features = torch.cat(pred_features, dim=0).reshape((1, process_num, pred_features[0].shape[0]))
-                        y_pred = avg_pool(pred_features)
-                        
-                        y_pred = (y_pred, None)
-                    else:
-                        y_pred = model(batch_dict['x'])
-                    
-                    # 현재 데이터에 앵커를 추가한 feature, label 리스트를 얻는다.
-                    features, labels = concat_saved_anchors(anchor_info, batch_dict, y_pred[0])
-                    
-                    # 단계 3. 손실을 계산합니다
-                    cur_loss = cluster_loss(features, [labels])
-                    
-                    anchor_info = update_anchor(anchor_info, args.saved_anchor_num, batch_dict, y_pred[0])
-                    
-                    if not torch.isinf(cur_loss).item():
-                        loss += cur_loss
-                        # 이동 손실과 이동 정확도를 계산합니다
-                        running_loss += (cur_loss.item() - running_loss) / (batch_index + 1)
-                    else:
-                        tf_writer.add_text(tag="book{0}/train/log".format(book), text_string="Inf occured", global_step=epoch_index)
-                    
-                    tf_writer.add_scalar(tag="book{0}/train/step_loss".format(book), scalar_value=cur_loss, global_step=(epoch_index) * paragraph_num + batch_index)
-                    
-                    #acc_t = None
-                    #running_acc += (acc_t - running_acc) / (batch_index + 1)
-                    
-                    if should_backward:
-                        # 특정 스텝 수마다 backward 수행. 그런 후에 detach하여 메모리 초기화
-                        # 단계 4. 손실을 사용해 그레이디언트를 계산합니다
-                        nan = torch.isnan(loss)
-                        inf = torch.isinf(loss)
-                        grad_fn = loss.grad_fn is not None
-                        if not nan and not inf and grad_fn:
-                            loss.backward()
-
-                            # 단계 5. 옵티마이저로 가중치를 업데이트합니다
-                            optimizer.step()
-                        else:
-                            if nan:
-                                tf_writer.add_text(tag="book{0}/train/log".format(book), text_string="NAN occured", global_step=epoch_index)
-                            if grad_fn:
-                                tf_writer.add_text(tag="book{0}/train/log".format(book), text_string="gradient is empty", global_step=epoch_index)
-                        
-                        loss = torch.zeros((1, 1)).to(device)
-                        
-                        
-                        # 메모리를 분리하여 계속 사용 가능하도록 함
-                        model.detach_memories_()
-                        del anchor_info
-                        anchor_info = dict()
-                        
-                        # 단계 1. 그레이디언트를 0으로 초기화합니다
-                        optimizer.zero_grad()
-                    # -----------------------------------------
-
-                    
-                    # 진행 상태 막대 업데이트
-                    train_bar.set_postfix(loss=running_loss)
-                    train_bar.update(len(batch_dict["speaker"]))
-
-
-                train_state['train_loss'].append(running_loss)
+                train_state['train_loss'].append(iter_loss)
                 #train_state['train_acc'].append(running_acc)
-                tf_writer.add_scalar(tag="book{0}/train/loss".format(book), scalar_value=running_loss, global_step=epoch_index)
+                tf_writer.add_scalar(tag="book{0}/train/loss".format(book), scalar_value=iter_loss, global_step=epoch_index)
 
                 if not args.test:
-                    book_bar.set_postfix(loss=running_loss, v1=v1)
+                    book_bar.set_postfix(loss=running_loss, FM=FM_score)
                 
                 book_bar.update()
 
@@ -605,11 +661,13 @@ def train_model(args, data_set, model):
                                 position=1)
             running_loss = 0.
             val_batch_idx = 0
-            running_v1 = 0.
+            running_score = 0.
             # 검증 세트에 대한 순회
             for book in val_books:
                 # 검증 세트와 배치 제너레이터 준비, 손실과 정확도를 0으로 설정
                 data_set.set_book(book)
+                cur_title = data_set.get_cur_title()
+
                 val_bar = tqdm.tqdm(desc='book{0} momentum'.format(book),
                                 total=data_set.get_num_batches(1),
                                 position=2, 
@@ -664,7 +722,12 @@ def train_model(args, data_set, model):
                     if should_detach_memories:
                         model.detach_memories_()
                 
-                cluster_phi, centroids, fig = calc_cluster_phi(np.array(cls_features), speakers)
+                cluster_phi, centroids, _ = calc_cluster_phi(np.array(cls_features), speakers)
+                
+                if epoch_index == 0:
+                    fig = visualize.plot_speaker_pie(speakers, cur_title)
+                    tf_writer.add_figure(tag="book{0}/train/speaker_pie".format(book), figure=fig, global_step=epoch_index)
+                
                 '''tf_writer.add_figure(
                     tag="book{0}/val/scatter".format(book), 
                     figure=fig,
@@ -672,10 +735,10 @@ def train_model(args, data_set, model):
                 )'''
 
                 if not args.test:
-                    homo, comp, v1, fig = metric.calc_v_measure_with_hdb(labels=speakers, features=np.array(cls_features))
-                    tf_writer.add_scalar(tag="book{0}/val/v1".format(book), scalar_value=v1, global_step=epoch_index)
-                    tf_writer.add_scalar(tag="book{0}/val/homogeneity".format(book), scalar_value=homo, global_step=epoch_index)
-                    tf_writer.add_scalar(tag="book{0}/val/completeness".format(book), scalar_value=comp, global_step=epoch_index)
+                    FM_score, fig = metric.calc_FM_score_with_hdb(labels=speakers, features=np.array(cls_features), draw_fig=True)
+                    tf_writer.add_scalar(tag="book{0}/val/FM".format(book), scalar_value=FM_score, global_step=epoch_index)
+                    #tf_writer.add_scalar(tag="book{0}/val/homogeneity".format(book), scalar_value=homo, global_step=epoch_index)
+                    #tf_writer.add_scalar(tag="book{0}/val/completeness".format(book), scalar_value=comp, global_step=epoch_index)
 
                     tf_writer.add_figure(tag="book{0}/val/cluster result".format(book), figure=fig, global_step=epoch_index)
                 
@@ -700,11 +763,13 @@ def train_model(args, data_set, model):
                 
                 paragraph_num = data_set.get_num_batches(1)
                 acu_paragraph_num = 0
-                
                 cls_features = []
                 speakers = []
+                
 
-                cluster_loss = ProtoSupConLoss(cluster_phi, centroids, sig=args.loss_sig)
+                cluster_loss = ProtoSupConLoss(cluster_phi, centroids, sig=args.loss_sig, save_dis=True)
+                pos_dis_dict = {s: [] for s in cluster_phi.keys()}
+                neg_dis_dict = {s: [] for s in cluster_phi.keys()}
 
                 for batch_index, batch_dict in enumerate(batch_generator):
                     acu_paragraph_num += len(batch_dict["x_length"]) 
@@ -743,7 +808,10 @@ def train_model(args, data_set, model):
                     features, labels = concat_saved_anchors(anchor_info, batch_dict, y_pred[0])
                     
                     # 단계 3. 손실을 계산합니다
-                    loss = cluster_loss(features, [labels])
+                    loss, step_pos_dis, step_neg_dis = cluster_loss(features, [labels])
+                    for s in step_pos_dis.keys():
+                        pos_dis_dict[s].append(np.mean(step_pos_dis[s]))
+                        neg_dis_dict[s].append(np.mean(step_neg_dis[s]))
                     
                     anchor_info = update_anchor(anchor_info, args.saved_anchor_num, batch_dict, y_pred[0])
 
@@ -769,18 +837,21 @@ def train_model(args, data_set, model):
 
                 running_loss += (loss.item() - running_loss) / (val_batch_idx + 1)
                 if not args.test:
-                    running_v1 += (v1 - running_v1) / (val_batch_idx + 1)
+                    running_score += (FM_score - running_score) / (val_batch_idx + 1)
 
-                book_bar.set_postfix(loss=running_loss, v1=running_v1)
+                book_bar.set_postfix(loss=running_loss, FM=running_score)
                 book_bar.update()
 
                 tf_writer.add_scalar(tag="book{0}/val/loss".format(book), scalar_value=book_loss, global_step=epoch_index)
+                for s in pos_dis_dict.keys():
+                    tf_writer.add_scalar(tag="book{0}/val/{1}_pos_dis".format(book, s), scalar_value=np.mean(pos_dis_dict[s]), global_step=epoch_index)
+                    tf_writer.add_scalar(tag="book{0}/val/{1}_neg_dis".format(book, s), scalar_value=np.mean(neg_dis_dict[s]), global_step=epoch_index)
                 #train_state['val_acc'].append(running_acc)
 
                 tf_writer.flush()
                 val_batch_idx += 1
             train_state['val_loss'].append(running_loss)
-            train_state["val_acc"].append(running_v1)
+            train_state["val_acc"].append(running_score)
             train_state = update_train_state(args=args, model=model, 
                                             train_state=train_state)
             
@@ -863,7 +934,7 @@ def main():
     )
     
     parser.add_argument(
-        "--latent_dimension",
+        "--feature_dimension",
         type=int,
         default=1000
     )
@@ -873,6 +944,12 @@ def main():
         type=int,
         default=1024
     )
+    parser.add_argument(
+        "--feature_freedom",
+        type=int,
+        default=1
+    )
+    
     
     parser.add_argument(
         "--seed",
@@ -933,6 +1010,12 @@ def main():
     )
     
     parser.add_argument(
+        "--book_train_iter",
+        default=2,
+        type=int
+    )
+    
+    parser.add_argument(
         "--reload_from_files",
         default=False,
         type=bool
@@ -961,21 +1044,20 @@ def main():
         type=bool
     )
     
-    '''args = parser.parse_args([
+    args = parser.parse_args([
         "--dataset_path", "data/pdnc/novels",
         "--save_dir", "models_storage/test",
         "--model_state_file", "model.pth",
-        "--latent_dimension", "2048",
+        "--feature_dimension", "2048",
         "--decoder_hidden", "2048",
-        "--saved_anchor_num", "3",
         "--detach_mems_step", "5",
         "--learning_rate", "2e-6",
         "--weight_decay", "0.1",
         "--seed", "201456",
         "--test", "",
-    ])'''
+    ])
 
-    args = parser.parse_args()
+    #args = parser.parse_args()
     # console argument 구성 및 받아오기
 
     if args.expand_filepaths_to_save_dir:

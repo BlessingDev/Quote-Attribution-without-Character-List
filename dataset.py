@@ -16,17 +16,21 @@ class PDNCDataset(Dataset):
     ):
         novels_dir = pathlib.Path(novel_dir_path)
         
+        self.novel_title_list = []
         self.novel_dir_list = []
         for dir in novels_dir.iterdir():
+            self.novel_title_list.append(dir.name)
             self.novel_dir_list.append(dir)
         
         self.cur_book = None
         self.book_num = len(self.novel_dir_list)
         self.tokenizer = tokenizer
         self._book_len = 0
+        self._cur_book_index = 0
         
     def set_book(self, book_index: int):
         cur_book_dir = self.novel_dir_list[book_index]
+        self._cur_book_index = book_index
         
         cur_book_file = pathlib.Path(os.path.join(cur_book_dir, "paragraph_list.json"))
         with cur_book_file.open() as f:
@@ -66,6 +70,9 @@ class PDNCDataset(Dataset):
             배치 개수
         """
         return len(self) // batch_size
+    
+    def get_cur_title(self):
+        return self.novel_title_list[self._cur_book_index]
 
         
 def generate_pdnc_batches(dataset, max_seq_length, shuffle=True, drop_last=True, device=torch.device("cpu")):
