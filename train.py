@@ -340,7 +340,6 @@ def train_model(args, data_set, model):
     train_books = [
         0, 1, 2, 4, 5, 6, 7, 9, 10, 11, 13, 14, 15, 16
     ]
-    train_books = [11]
     # 
     val_books = [
         3, 8, 12, 17
@@ -575,8 +574,8 @@ def train_model(args, data_set, model):
                     
                     if log_distance:
                         for s in pos_dis_dict.keys():
-                            tf_writer.add_scalar(tag="book{0}/train/{1}_pos_dis".format(book, s), scalar_value=np.mean(pos_dis_dict[s]), global_step=(epoch_index * args.book_train_iter + book_iter_idx))
-                            tf_writer.add_scalar(tag="book{0}/train/{1}_neg_dis".format(book, s), scalar_value=np.mean(neg_dis_dict[s]), global_step=(epoch_index * args.book_train_iter + book_iter_idx))
+                            tf_writer.add_scalar(tag="book{0}/train/dis/{1}_pos_dis".format(book, s), scalar_value=np.mean(pos_dis_dict[s]), global_step=(epoch_index * args.book_train_iter + book_iter_idx))
+                            tf_writer.add_scalar(tag="book{0}/train/dis/{1}_neg_dis".format(book, s), scalar_value=np.mean(neg_dis_dict[s]), global_step=(epoch_index * args.book_train_iter + book_iter_idx))
 
                 # -----------------------------------------------------
                 # book iter 훈련 종료
@@ -719,7 +718,7 @@ def train_model(args, data_set, model):
                     else:
                         y_pred = model(batch_dict['x'])
                     
-                    cls_features.extend([feature.detach().cpu().numpy() for feature in y_pred[0][0][batch_dict["cls_index"]]])
+                    cls_features.extend([feature.detach().cpu().numpy() for feature in y_pred[0]])
                     speakers.extend(batch_dict["speaker"])
 
                     
