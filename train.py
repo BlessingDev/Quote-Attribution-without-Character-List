@@ -153,13 +153,13 @@ def update_anchor(
         if cur_anchor_count == 0 or cur_anchor_count < anchor_num:
             # 새 특성 벡터 등록
             # batch를 1로 둔 특수한 경우의 코드
-            cur_anchor_list.append(y_pred[0][batch_dict["cls_index"][i]].view(1, -1))
+            cur_anchor_list.append(y_pred[i].view(1, -1))
             anchor_info[speaker] = cur_anchor_list
             
         elif cur_anchor_count == anchor_num:
             # 충분한 숫자가 앵커로 들어가 있을 때는 queue 구조로 먼저 들어온 것을 밀어내고 새 것을 넣는다.
             cur_anchor_list.pop(0)
-            cur_anchor_list.append(y_pred[0][batch_dict["cls_index"][i]].view(1, -1))
+            cur_anchor_list.append(y_pred[i].view(1, -1))
             anchor_info[speaker] = cur_anchor_list
     
     return anchor_info
@@ -182,7 +182,7 @@ def concat_saved_anchors(
         
         saved_anchors = torch.cat(anchor_features, dim=0).to(device)
         # 전체 예측에서 CLS 토큰 특징만 분리
-        pred_features = torch.cat([y_pred[0, cls_idx, :].view(1, -1) for cls_idx in batch_dict["cls_index"]], dim=0)
+        pred_features = y_pred
         
         features_con = torch.cat((pred_features, saved_anchors), dim=0)
         
@@ -192,9 +192,9 @@ def concat_saved_anchors(
         return features_con.reshape(1, features_con.shape[0], -1), speaker_con
     else:
         # 전체 예측에서 CLS 토큰 특징만 분리
-        pred_features = torch.cat([y_pred[0, cls_idx, :].view(1, -1) for cls_idx in batch_dict["cls_index"]], dim=0)
+        pred_features = y_pred
         
-        return pred_features.view(1, pred_features.shape[0], -1), batch_dict["speaker"]
+        return pred_features.unsqueeze(0), batch_dict["speaker"]
 
 def calc_cluster_phi(
         features, 
@@ -337,38 +337,46 @@ def train_model(args, data_set, model):
     
     if args.test:
         torch.autograd.set_detect_anomaly(True)
+    train_books = [
+        0, 1, 2, 4, 5, 6, 7, 9, 10, 11, 13, 14, 15, 16
+    ]
+    train_books = [11]
+    # 
+    val_books = [
+        3, 8, 12, 17
+    ]
+    test_books = [
+        18, 19, 20, 21
+    ]
     
+    book_bar = tqdm.tqdm(desc='books', 
+                        total=len(train_books),
+                        position=1)
+    train_bar = tqdm.tqdm(desc="",
+                        total=10,
+                        position=2,
+                        leave=True)
+    val_bar = tqdm.tqdm(desc="",
+                        total=10,
+                        position=2, 
+                        leave=True)
     try:
         for epoch_index in range(args.max_epochs):
             
             start_time = time.time()
             # 훈련 세트에 대한 순회
-            train_books = [
-                0, 1, 2, 4, 5, 6, 7, 9, 10, 11, 13, 14, 15, 16
-            ]
-            # 
-            val_books = [
-                3, 8, 12, 17
-            ]
-            test_books = [
-                18, 19, 20, 21
-            ]
-            book_bar = tqdm.tqdm(desc='books', 
-                                total=len(train_books),
-                                position=1)
             random.shuffle(train_books)
 
             for book in train_books:
                 # 훈련 세트와 배치 제너레이터 준비, 손실과 정확도를 0으로 설정
                 data_set.set_book(book)
-                train_bar = tqdm.tqdm(desc='book{0} momentum'.format(book),
-                                      total=data_set.get_num_batches(1),
-                                      position=2,
-                                      leave=True)
                 batch_generator = generate_pdnc_batches(data_set,
                                                         max_seq_length=tokenizer.model_max_length,
                                                         device=device)
-
+                train_bar.n = 0
+                train_bar.total = data_set.get_num_batches(1)
+                train_bar.desc = 'book{0} momentum'.format(book)
+                
                 cls_features = []
                 speakers = []
                 model.init_memories()
@@ -404,18 +412,19 @@ def train_model(args, data_set, model):
                                     (torch.tensor([[tokenizer.cls_token_id]]).to(device), x_i), dim=1)
                                 error_accum += 1
 
-                            pred = model(x_i)
-                            pred_features.append(pred[0][0][0])
+                            pred = model(input_ids=x_i, cls_idx=[0])
+                            pred_features.append(pred[0][0])
 
                         pred_features = torch.cat(pred_features, dim=0).reshape(
                             (1, process_num, pred_features[0].shape[0]))
                         y_pred = avg_pool(pred_features)
 
-                        y_pred = (y_pred, None)
+                        y_pred = (y_pred.squeeze(0), None)
                     else:
-                        y_pred = model(batch_dict['x'])
+                        y_pred = model(input_ids=batch_dict['x'], cls_idx=batch_dict["cls_index"])
 
-                    cls_features.extend([feature.detach().cpu().numpy() for feature in y_pred[0][0][batch_dict["cls_index"]]])
+                    # model에서 cls_idx의 feature만 나오니 이제 cls 위치를 따로 걸러낼 필요가 없어진다
+                    cls_features.extend([feature.detach().cpu().numpy() for feature in y_pred[0]])
                     speakers.extend(batch_dict["speaker"])
 
                         # 진행 상태 막대 업데이트
@@ -432,14 +441,14 @@ def train_model(args, data_set, model):
                 model.train()
                 iter_loss = []
                 log_distance = True
-                cluster_loss = ProtoSupConLoss(cluster_phi, centroids, sig=args.loss_sig, save_dis=log_distance)
+                cluster_loss = ProtoSupConLoss(cluster_phi, centroids, sig=args.loss_sig, log_distance=log_distance)
                 
                 for book_iter_idx in range(args.book_train_iter):
                     data_set.set_book(book)
-                    train_bar = tqdm.tqdm(desc='book{0}-{1}'.format(book, book_iter_idx),
-                                                total=data_set.get_num_batches(1), 
-                                                position=2, 
-                                                leave=True)
+                    train_bar.n = 0
+                    train_bar.desc = 'book{0}-{1}'.format(book, book_iter_idx)
+                    train_bar.total = data_set.get_num_batches(1)
+                    
                     batch_generator = generate_pdnc_batches(data_set,
                                                         max_seq_length=tokenizer.model_max_length,
                                                         device=device)
@@ -491,15 +500,15 @@ def train_model(args, data_set, model):
                                     x_i = torch.cat((torch.tensor([[tokenizer.cls_token_id]]).to(device), x_i), dim=1)
                                     error_accum += 1
                                 
-                                pred = model(x_i)
-                                pred_features.append(pred[0][0][0])
+                                pred = model(x_i, cls_idx=[0])
+                                pred_features.append(pred[0][0])
                             
                             pred_features = torch.cat(pred_features, dim=0).reshape((1, process_num, pred_features[0].shape[0]))
                             y_pred = avg_pool(pred_features)
                             
-                            y_pred = (y_pred, None)
+                            y_pred = (y_pred.squeeze(0), None)
                         else:
-                            y_pred = model(batch_dict['x'])
+                            y_pred = model(batch_dict['x'], cls_idx=batch_dict["cls_index"])
                         
                         # 현재 데이터에 앵커를 추가한 feature, label 리스트를 얻는다.
                         features, labels = concat_saved_anchors(anchor_info, batch_dict, y_pred[0])
@@ -566,17 +575,16 @@ def train_model(args, data_set, model):
                     
                     if log_distance:
                         for s in pos_dis_dict.keys():
-                            tf_writer.add_scalar(tag="book{0}/train/step_{1}_pos_dis".format(book, s), scalar_value=np.mean(pos_dis_dict[s]), global_step=(epoch_index * args.book_train_iter + book_iter_idx))
-                            tf_writer.add_scalar(tag="book{0}/train/step_{1}_neg_dis".format(book, s), scalar_value=np.mean(neg_dis_dict[s]), global_step=(epoch_index * args.book_train_iter + book_iter_idx))
+                            tf_writer.add_scalar(tag="book{0}/train/{1}_pos_dis".format(book, s), scalar_value=np.mean(pos_dis_dict[s]), global_step=(epoch_index * args.book_train_iter + book_iter_idx))
+                            tf_writer.add_scalar(tag="book{0}/train/{1}_neg_dis".format(book, s), scalar_value=np.mean(neg_dis_dict[s]), global_step=(epoch_index * args.book_train_iter + book_iter_idx))
 
                 # -----------------------------------------------------
                 # book iter 훈련 종료
                 
                 data_set.set_book(book)
-                train_bar = tqdm.tqdm(desc='book{0} momentum'.format(book),
-                                      total=data_set.get_num_batches(1),
-                                      position=2,
-                                      leave=True)
+                train_bar.n = 0
+                train_bar.total = data_set.get_num_batches(1)
+                train_bar.desc = 'book{0} momentum'.format(book)
                 batch_generator = generate_pdnc_batches(data_set,
                                                         max_seq_length=tokenizer.model_max_length,
                                                         device=device)
@@ -613,18 +621,18 @@ def train_model(args, data_set, model):
                                     (torch.tensor([[tokenizer.cls_token_id]]).to(device), x_i), dim=1)
                                 error_accum += 1
 
-                            pred = model(x_i)
-                            pred_features.append(pred[0][0][0])
+                            pred = model(x_i, cls_idx=[0])
+                            pred_features.append(pred[0][0])
 
                         pred_features = torch.cat(pred_features, dim=0).reshape(
                             (1, process_num, pred_features[0].shape[0]))
                         y_pred = avg_pool(pred_features)
 
-                        y_pred = (y_pred, None)
+                        y_pred = (y_pred.squeeze(0), None)
                     else:
-                        y_pred = model(batch_dict['x'])
+                        y_pred = model(batch_dict['x'], cls_idx=batch_dict["cls_index"])
 
-                    cls_features.extend([feature.detach().cpu().numpy() for feature in y_pred[0][0][batch_dict["cls_index"]]])
+                    cls_features.extend([feature.detach().cpu().numpy() for feature in y_pred[0]])
                     speakers.extend(batch_dict["speaker"])
 
                         # 진행 상태 막대 업데이트
@@ -656,9 +664,8 @@ def train_model(args, data_set, model):
             gc.collect()
             torch.cuda.empty_cache()
 
-            book_bar = tqdm.tqdm(desc='books', 
-                                total=len(val_books),
-                                position=1)
+            book_bar.n = 0
+            
             running_loss = 0.
             val_batch_idx = 0
             running_score = 0.
@@ -668,10 +675,9 @@ def train_model(args, data_set, model):
                 data_set.set_book(book)
                 cur_title = data_set.get_cur_title()
 
-                val_bar = tqdm.tqdm(desc='book{0} momentum'.format(book),
-                                total=data_set.get_num_batches(1),
-                                position=2, 
-                                leave=True)
+                val_bar.n = 0
+                val_bar.total = data_set.get_num_batches(1)
+                val_bar.desc = 'book{0} momentum'.format(book)
                 batch_generator = generate_pdnc_batches(data_set, 
                                                     max_seq_length=tokenizer.model_max_length,
                                                     device=device)
@@ -704,12 +710,12 @@ def train_model(args, data_set, model):
                                 error_accum += 1
                             
                             pred = model(x_i)
-                            pred_features.append(pred[0][0][0])
+                            pred_features.append(pred[0][0])
                         
                         pred_features = torch.cat(pred_features, dim=0).reshape((1, process_num, pred_features[0].shape[0]))
                         y_pred = avg_pool(pred_features)
                         
-                        y_pred = (y_pred, None)
+                        y_pred = (y_pred.squeeze(0), None)
                     else:
                         y_pred = model(batch_dict['x'])
                     
@@ -744,10 +750,9 @@ def train_model(args, data_set, model):
                 
                 # 검증 세트와 배치 제너레이터 준비, 손실과 정확도를 0으로 설정
                 data_set.set_book(book)
-                val_bar = tqdm.tqdm(desc='book{0}'.format(book),
-                                total=data_set.get_num_batches(1),
-                                position=2, 
-                                leave=True)
+                val_bar.n = 0
+                val_bar.total = data_set.get_num_batches(1)
+                val_bar.desc = 'book{0} momentum'.format(book)
                 batch_generator = generate_pdnc_batches(data_set, 
                                                     max_seq_length=tokenizer.model_max_length,
                                                     device=device)
@@ -796,12 +801,12 @@ def train_model(args, data_set, model):
                                 error_accum += 1
                             
                             pred = model(x_i)
-                            pred_features.append(pred[0][0][0])
+                            pred_features.append(pred[0][0])
                         
                         pred_features = torch.cat(pred_features, dim=0).reshape((1, process_num, pred_features[0].shape[0]))
                         y_pred = avg_pool(pred_features)
                         
-                        y_pred = (y_pred, None)
+                        y_pred = (y_pred.squeeze(0), None)
                     else:
                         y_pred = model(batch_dict['x'])
                         
@@ -867,6 +872,7 @@ def train_model(args, data_set, model):
                 
             train_bar.n = 0
             val_bar.n = 0
+            book_bar.n = 0
             epoch_bar.set_postfix(best_val=train_state['early_stopping_best_val'] )
             epoch_bar.update()
 
@@ -1044,7 +1050,7 @@ def main():
         type=bool
     )
     
-    args = parser.parse_args([
+    '''args = parser.parse_args([
         "--dataset_path", "data/pdnc/novels",
         "--save_dir", "models_storage/test",
         "--model_state_file", "model.pth",
@@ -1055,9 +1061,9 @@ def main():
         "--weight_decay", "0.1",
         "--seed", "201456",
         "--test", "",
-    ])
+    ])'''
 
-    #args = parser.parse_args()
+    args = parser.parse_args()
     # console argument 구성 및 받아오기
 
     if args.expand_filepaths_to_save_dir:

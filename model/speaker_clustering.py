@@ -14,27 +14,21 @@ class SpeakerClusterModel(nn.Module):
         self.infini_bert = InfiniBertModel.from_pretrained("bert-base-uncased", config=config, add_pooling_layer=False)
         self.config = self.infini_bert.config
         
-        self.initial_presentation = nn.Sequential(
-            nn.Linear(config.hidden_size, config.decoder_intermediate_size),
-            nn.ELU()
-        )
+        self.sequencial_decoder = nn.GRU(input_size=config.hidden_size, hidden_size=config.decoder_intermediate_size, batch_first=True)
         
-        self.decoder_hidden = nn.Sequential(
-            nn.Linear(config.decoder_intermediate_size, config.decoder_intermediate_size),
-            nn.ELU(),
-            nn.Dropout(p=0.5),
-            nn.Linear(config.decoder_intermediate_size, config.decoder_intermediate_size)
-        )
         self.decoder = nn.Sequential(
             nn.Linear(config.decoder_intermediate_size, config.feature_dimension),
             nn.Tanh()
         )
         
         self.feature_freedom = config.feature_freedom
+        
+        self.rnn_last_hidden = None
     
     def forward(
         self, 
         input_ids: Optional[torch.Tensor] = None,
+        cls_idx: Optional[List] = None,
         attention_mask: Optional[torch.Tensor] = None,
         token_type_ids: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
@@ -66,20 +60,33 @@ class SpeakerClusterModel(nn.Module):
             return_dict,
         )
         
-        last_hidden = encoder_output.last_hidden_state
+        # bert_last_hidden: (b n d_model)
+        bert_last_hidden = encoder_output.last_hidden_state
         
-        initial_hidden = self.initial_presentation(last_hidden)
-        latent_hidden = self.decoder_hidden(initial_hidden)
-        norm_hidden = nn.LayerNorm(initial_hidden.shape[1:], device=latent_hidden.device)(latent_hidden)
-        norm_hidden = norm_hidden + initial_hidden
+        if cls_idx is None:
+            cls_idx = [0]
+        cls_hidden = bert_last_hidden[0][cls_idx].unsqueeze(0)
         
-        latent_features = self.decoder(norm_hidden)
+        # b = 1
+        # rnn_out: (b t rnn_hidden)
+        # rnn_h: (rnn_layer b rnn_hidden)
+        if self.rnn_last_hidden is not None:
+            rnn_out, rnn_h = self.sequencial_decoder(cls_hidden, self.rnn_last_hidden)
+        else:
+            rnn_out, rnn_h = self.sequencial_decoder(cls_hidden)
+        
+        self.rnn_last_hidden = rnn_h
+        seq_feature = rnn_out[-1, :, :]
+        
+        latent_features = self.decoder(seq_feature)
         latent_features = latent_features * self.feature_freedom
         
         return (latent_features), encoder_output
 
     def init_memories(self):
+        self.rnn_last_hidden = None
         self.infini_bert.encoder.init_memories()
     
     def detach_memories_(self):
+        self.rnn_last_hidden = self.rnn_last_hidden.detach_()
         self.infini_bert.encoder.detach_memories_()
