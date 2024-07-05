@@ -292,6 +292,43 @@ def detach_achors(achor_info:dict):
         for i, feature in enumerate(achor_info[k]):
             achor_info[k][i] = feature.contiguous().detach()
 
+def get_model_prediction(batch_dict, tokenizer, model, device):
+    seq_length = np.sum(batch_dict["x_length"])
+    if seq_length > tokenizer.model_max_length:
+        # 문단 길이가 context window를 초과할 때
+        # 문단에서 발화자가 달라지지 않고 전체가 다 한 사람이 말한 것이거나 설명문이거나
+        # 여러 번 출력을 받아 pooling하는 방식으로 해결
+        process_num = (
+            seq_length // tokenizer.model_max_length) + 1
+        avg_pool = nn.AvgPool2d(
+            kernel_size=(process_num, 1), stride=1)
+        pred_features = []
+        error_accum = 0
+                        
+        for i in range(process_num):
+            x_i = batch_dict['x'][0][i * tokenizer.model_max_length - error_accum: min(
+                seq_length, (i + 1) * tokenizer.model_max_length) - error_accum].reshape((1, -1))
+            if x_i[0][0] != tokenizer.cls_token_id:
+                x_i = batch_dict['x'][0][i * tokenizer.model_max_length - error_accum: min(
+                    seq_length, (i + 1) * tokenizer.model_max_length - 1) - error_accum].reshape((1, -1))
+                x_i = torch.cat(
+                    (torch.tensor([[tokenizer.cls_token_id]]).to(device), x_i), dim=1)
+                error_accum += 1
+
+            pred = model(input_ids=x_i, cls_idx=[0])
+            pred_features.append(pred[0][0])
+
+        pred_features = torch.cat(pred_features, dim=0).reshape(
+            (1, process_num, pred_features[0].shape[0]))
+        y_pred = avg_pool(pred_features)
+
+        y_pred = (y_pred.squeeze(0), None)
+    else:
+        y_pred = model(input_ids=batch_dict['x'], cls_idx=batch_dict["cls_index"])
+
+    return y_pred
+
+
 def train_model(args, data_set, model):
     print(args)
     
@@ -365,7 +402,8 @@ def train_model(args, data_set, model):
             start_time = time.time()
             # 훈련 세트에 대한 순회
             random.shuffle(train_books)
-
+            
+            book_bar.total = len(train_books)
             for book in train_books:
                 # 훈련 세트와 배치 제너레이터 준비, 손실과 정확도를 0으로 설정
                 data_set.set_book(book)
@@ -440,7 +478,12 @@ def train_model(args, data_set, model):
                 model.train()
                 iter_loss = []
                 log_distance = True
-                cluster_loss = ProtoSupConLoss(cluster_phi, centroids, sig=args.loss_sig, log_distance=log_distance)
+                cluster_loss = ProtoSupConLoss(
+                    cluster_phi, centroids, speakers, 
+                    sig=args.loss_sig, 
+                    log_distance=log_distance,
+                    epsilon=args.loss_epsilon
+                )
                 
                 for book_iter_idx in range(args.book_train_iter):
                     data_set.set_book(book)
@@ -664,6 +707,7 @@ def train_model(args, data_set, model):
             torch.cuda.empty_cache()
 
             book_bar.n = 0
+            book_bar.total = len(val_books)
             
             running_loss = 0.
             val_batch_idx = 0
@@ -716,7 +760,7 @@ def train_model(args, data_set, model):
                         
                         y_pred = (y_pred.squeeze(0), None)
                     else:
-                        y_pred = model(batch_dict['x'])
+                        y_pred = model(batch_dict['x'], cls_idx=batch_dict["cls_index"])
                     
                     cls_features.extend([feature.detach().cpu().numpy() for feature in y_pred[0]])
                     speakers.extend(batch_dict["speaker"])
@@ -767,13 +811,19 @@ def train_model(args, data_set, model):
                 
                 paragraph_num = data_set.get_num_batches(1)
                 acu_paragraph_num = 0
-                cls_features = []
-                speakers = []
                 
 
-                cluster_loss = ProtoSupConLoss(cluster_phi, centroids, sig=args.loss_sig, save_dis=True)
+                cluster_loss = ProtoSupConLoss(
+                    cluster_phi, centroids, speakers, 
+                    sig=args.loss_sig, 
+                    log_distance=log_distance,
+                    epsilon=args.loss_epsilon
+                )
                 pos_dis_dict = {s: [] for s in cluster_phi.keys()}
                 neg_dis_dict = {s: [] for s in cluster_phi.keys()}
+                
+                cls_features = []
+                speakers = []
 
                 for batch_index, batch_dict in enumerate(batch_generator):
                     acu_paragraph_num += len(batch_dict["x_length"]) 
@@ -807,7 +857,7 @@ def train_model(args, data_set, model):
                         
                         y_pred = (y_pred.squeeze(0), None)
                     else:
-                        y_pred = model(batch_dict['x'])
+                        y_pred = model(batch_dict['x'], cls_idx=batch_dict["cls_index"])
                         
                     features, labels = concat_saved_anchors(anchor_info, batch_dict, y_pred[0])
                     
@@ -848,8 +898,8 @@ def train_model(args, data_set, model):
 
                 tf_writer.add_scalar(tag="book{0}/val/loss".format(book), scalar_value=book_loss, global_step=epoch_index)
                 for s in pos_dis_dict.keys():
-                    tf_writer.add_scalar(tag="book{0}/val/{1}_pos_dis".format(book, s), scalar_value=np.mean(pos_dis_dict[s]), global_step=epoch_index)
-                    tf_writer.add_scalar(tag="book{0}/val/{1}_neg_dis".format(book, s), scalar_value=np.mean(neg_dis_dict[s]), global_step=epoch_index)
+                    tf_writer.add_scalar(tag="book{0}/val/dis/{1}_pos_dis".format(book, s), scalar_value=np.mean(pos_dis_dict[s]), global_step=epoch_index)
+                    tf_writer.add_scalar(tag="book{0}/val/dis/{1}_neg_dis".format(book, s), scalar_value=np.mean(neg_dis_dict[s]), global_step=epoch_index)
                 #train_state['val_acc'].append(running_acc)
 
                 tf_writer.flush()
@@ -879,17 +929,17 @@ def train_model(args, data_set, model):
             
     except KeyboardInterrupt:
         print("반복 중지")
-        tf_writer.add_hparams(hparam_dict=hparam_dict, metric_dict={"v1": train_state['val_acc'][-1]})
+        tf_writer.add_hparams(hparam_dict=hparam_dict, metric_dict={"v1": train_state['early_stopping_best_val']})
         tf_writer.close()
         return train_state
 
     except torch.cuda.OutOfMemoryError:
         print("메모리 부족")
-        tf_writer.add_hparams(hparam_dict=hparam_dict, metric_dict={"v1": train_state['val_acc'][-1]})
+        tf_writer.add_hparams(hparam_dict=hparam_dict, metric_dict={"v1": train_state['early_stopping_best_val']})
         tf_writer.close()
         return train_state
     
-    tf_writer.add_hparams(hparam_dict=hparam_dict, metric_dict={"v1": train_state['val_acc'][-1]})
+    tf_writer.add_hparams(hparam_dict=hparam_dict, metric_dict={"v1": train_state['early_stopping_best_val']})
     tf_writer.close()
     return train_state
 
@@ -1002,6 +1052,12 @@ def main():
         default=0.5,
         type=float
     )
+    
+    parser.add_argument(
+        "--loss_epsilon",
+        default=10,
+        type=int
+    )
 
     parser.add_argument(
         "--early_stopping_criteria",
@@ -1053,8 +1109,8 @@ def main():
         "--dataset_path", "data/pdnc/novels",
         "--save_dir", "models_storage/test",
         "--model_state_file", "model.pth",
-        "--feature_dimension", "2048",
-        "--decoder_hidden", "2048",
+        "--feature_dimension", "10000",
+        "--decoder_hidden", "5000",
         "--detach_mems_step", "5",
         "--learning_rate", "2e-6",
         "--weight_decay", "0.1",

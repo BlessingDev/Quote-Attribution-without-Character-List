@@ -156,7 +156,7 @@ def plot_hdbs_cluster(hdbs, features, labels):
             cluster_center["component2"], 
             s=incluster_ratio * 20,
             color=l_col, 
-            marker="o",
+            marker="*",
             alpha=0.9,
             zorder=10
         )

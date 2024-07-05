@@ -14,11 +14,13 @@ class SpeakerClusterModel(nn.Module):
         self.infini_bert = InfiniBertModel.from_pretrained("bert-base-uncased", config=config, add_pooling_layer=False)
         self.config = self.infini_bert.config
         
-        self.sequencial_decoder = nn.GRU(input_size=config.hidden_size, hidden_size=config.decoder_intermediate_size, batch_first=True)
+        self.sequencial_decoder = nn.GRU(input_size=config.hidden_size, hidden_size=config.hidden_size, batch_first=True)
         
         self.decoder = nn.Sequential(
-            nn.Linear(config.decoder_intermediate_size, config.feature_dimension),
-            nn.Tanh()
+            nn.Linear(config.hidden_size, config.decoder_intermediate_size),
+            nn.ELU(),
+            nn.Dropout(p=config.hidden_dropout_prob),
+            nn.Linear(config.decoder_intermediate_size, config.feature_dimension)
         )
         
         self.feature_freedom = config.feature_freedom
@@ -79,7 +81,7 @@ class SpeakerClusterModel(nn.Module):
         seq_feature = rnn_out[-1, :, :]
         
         latent_features = self.decoder(seq_feature)
-        latent_features = latent_features * self.feature_freedom
+        #latent_features = latent_features * self.feature_freedom
         
         return (latent_features), encoder_output
 
