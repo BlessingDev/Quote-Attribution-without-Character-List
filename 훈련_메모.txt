@@ -192,11 +192,28 @@ loss에 대한 분석도 필요하다.
 0704_
 - 모델의 최종 head를 MLP로 변경
 
+0705
+- FM 점수가 잘 작동하지 않음을 발견
+    - adjusted random index로 metric을 변경
+- postive 거리 제곱으로 penalty를 주는 것이 다소 약한 듯하여 exp로 변경
+- 인명을 식별할 때 대문자 여부가 중요. bert 모델을 cased로 변경
+
+0708
+- BERT를 RoBERTa로 변경
+- k-means로 anchor를 찾을 때 평균점과 anchor 거리가 일정 이상 떨어져 있으면 anchor를 할당하지 않음.
+    - 주로 소수 label에 anchor가 할당되지 않을 가능성이 높음
+- loss 수정
+    - 설명문은 아예 loss 계산에서 빼고 발화문 간에만 clustering loss 계산
+    - 대신에 별개의 head를 두어 설명문인가 여부를 분류하도록 개선
+    - 우선 별개의 파라미터 없이 두 loss를 동일하게 더해서 사용
+    - loss 계산시 narrative 분류 정확도만큼 contrastive loss를 통합
+- clustering 기법을 hdbscan에서 bisecting k-means로 변경
 
 추후
 여타 prototypical classification 연구 탐색 (Gram matrix)
-k-means로 anchor를 찾을 때 평균점과 anchor 거리가 일정 이상 떨어져 있으면 anchor를 할당하지 않는 방향으로 진행해보자.
 BERT 대신 RoBERTa 도입. 추후에는 T-5까지 고려
+공통적으로 클러스터링 안 된 샘플이 많을수록 점수가 높아지는 듯함. 그러나 이런 게 분류에는 매우 좋지 않음. 어떤 로스를 써야 -1 샘플이 줄어들지 고민해봐야할 것
+손실에서 앵커 거리의 중요도를 훈련이 진행됨에 따라 천천히 올리는 기법
 
 
 domain incremental 고려 (여러 권의 책으로 batch 구성)

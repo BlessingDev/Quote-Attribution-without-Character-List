@@ -36,10 +36,12 @@ class ProtoSupConLoss(nn.Module):
             label_dict = {}
 
             for idx, label in enumerate(labels[b]):
-                c = label
-                l = label_dict.get(c, [])
-                l.append(idx)
-                label_dict[c] = l
+                # 모든 narrative는 계산에서 제외
+                if label != '':
+                    c = label
+                    l = label_dict.get(c, [])
+                    l.append(idx)
+                    label_dict[c] = l
         
             label_dicts.append(label_dict)
 
@@ -64,15 +66,12 @@ class ProtoSupConLoss(nn.Module):
 
                     # 각 레이블에 들어있는 샘플을 순회
                     for i in range(len(batch_dict[k])):
-                        #negative_indices = [idx for idx in range(sample_size) if idx != i]
                         cur_feature = positive_features[i].unsqueeze(0)
                         if len(negative_indices) > 0:
                             # cos 유사도 대신 L2 거리를 사용
-                            #negative_loss = torch.div(torch.matmul(cur_feature, negative_features.T), self.temperature).view(1, -1)
                             negative_loss = torch.cdist(cur_feature, features[batch_idx, negative_indices])
                             # 수치 안정성을 위해서
                             neg_dis = negative_loss
-                            #logits = logits / negative_features.shape[0]
 
                             # negative 거리의 영향을 줄이기 위해 평균을 구함
                             # postive 거리의 평균합은 이제 negative 거리의 평균합보다 훨씬 작아져야 함
@@ -83,7 +82,6 @@ class ProtoSupConLoss(nn.Module):
 
                             for j in range(len(batch_dict[k])):
                                 if i != j:
-                                    #anchor_contrast = torch.div(torch.matmul(cur_feature, positive_features[j]), self.temperature)
                                     anchor_contrast = torch.cdist(cur_feature, positive_features[j].unsqueeze(0))
                                     norm_contrast = anchor_contrast
 
@@ -96,9 +94,12 @@ class ProtoSupConLoss(nn.Module):
                             pos_x = torch.mean(pos_dis)
                             norm_pos_sup = mu_pos * pos_x
 
-                        
-                            pos_cent = torch.Tensor(self.centroids[k]).to(device)
-                            pos_phi = torch.Tensor([self.phi[k]]).to(device)
+
+                            # positive의 anchor가 없을 수 있음을 감안해야 함
+                            pos_cent = self.centroids.get(k, None)
+                            if pos_cent is not None:
+                                pos_cent = torch.Tensor(self.centroids[k]).to(device)
+                                pos_phi = torch.Tensor([self.phi[k]]).to(device)
                             
                             # 현재 positive가 아닌 모든 label의 집합
                             neg_label_set = set([l for l in self.centroids.keys() if l != k])
@@ -106,29 +107,28 @@ class ProtoSupConLoss(nn.Module):
                             neg_cents = torch.stack([torch.Tensor(self.centroids[n_l]).to(device) for n_l in neg_label_set])
                             neg_phis = torch.stack([torch.Tensor([self.phi[n_l]]).to(device) for n_l in neg_label_set])
                             
-                            #cent_contrast = torch.div(torch.matmul(cur_feature, pos_cent), pos_phi).view(1, -1)
-                            pos_cent_dis = torch.cdist(cur_feature, pos_cent.unsqueeze(0))
-                            cent_contrast = torch.div(pos_cent_dis, pos_phi).view(1, -1)
-                            norm_contrast = cent_contrast
-                            pos_cent_logit = mu_pos * norm_contrast
+                            if pos_cent is not None:
+                                pos_cent_dis = torch.cdist(cur_feature, pos_cent.unsqueeze(0))
+                                cent_contrast = torch.div(pos_cent_dis, pos_phi).view(1, -1)
+                                norm_contrast = cent_contrast
+                                pos_cent_logit = mu_pos * norm_contrast
                             
-                            #negative_cent_loss = torch.div(torch.matmul(cur_feature, neg_cents.T), neg_phis)
                             negative_cent_loss = torch.stack([torch.div(torch.cdist(cur_feature, neg_cents[idx].unsqueeze(0)).squeeze(), neg_phis[idx]) for idx in range(neg_cents.shape[0])])
                             # 수치 안정성을 위해서
                             logits = negative_cent_loss
-                            #logits = logits / neg_cents.shape[0]
 
                             neg_cent_x = torch.mean(logits * mu_neg)
                             negative_cent_logits = neg_cent_x
 
-                            pos_spcl = self.sig * norm_pos_sup + (1 - self.sig) * pos_cent_logit
-                            neg_spcl = self.sig * neg_sup + (1 - self.sig) * negative_cent_logits
+                            if pos_cent is not None:
+                                pos_spcl = self.sig * norm_pos_sup + (1 - self.sig) * pos_cent_logit
+                            else:
+                                pos_spcl = norm_pos_sup
                             
-                            #norm_prob = torch.multiply(torch.div(1, positive_num + 1), torch.div(pos_spcl, neg_spcl))
-                            #norm_prob = torch.log(norm_prob)
+                            neg_spcl = self.sig * neg_sup + (1 - self.sig) * negative_cent_logits
 
                             # pos_spcl의 제곱값에 penalty
-                            total_prob = pos_spcl - neg_spcl + self.epsilon + pos_spcl ** 2
+                            total_prob = pos_spcl - neg_spcl + self.epsilon + torch.exp(pos_spcl) - 1
                             
                             # 화자 비율로 정규화
                             total_prob = total_prob / self.speaker_counter.get(k, 1)
@@ -138,7 +138,10 @@ class ProtoSupConLoss(nn.Module):
 
                             if self.log_distance:
                                 pos_dis_list =  pos_dis_dict.get(k, [])
-                                pos_dis_list.append(pos_x.item() + cent_contrast.item())
+                                log_pos_dis = pos_x.item()
+                                if pos_cent is not None:
+                                    log_pos_dis += cent_contrast.item()
+                                pos_dis_list.append(log_pos_dis)
                                 pos_dis_dict[k] = pos_dis_list
 
                                 neg_dis_list =  neg_dis_dict.get(k, [])
@@ -152,6 +155,34 @@ class ProtoSupConLoss(nn.Module):
         
         return norm_loss, pos_dis_dict, neg_dis_dict
 
+class NarrativeDescLoss(nn.Module):
+    def __init__(self):
+        super(NarrativeDescLoss, self).__init__()
+    
+    
+    def forward(self, features, labels):
+        device = features.device
+        
+        batch_size = features.shape[0]
+        sample_size = features.shape[1]
+        
+        total_loss = torch.zeros(1)
+        
+        bce_loss = nn.BCEWithLogitsLoss()
+        num_labels = []
+        for b in range(batch_size):
+            batch_labels = []
+            for s in range(sample_size):
+                if labels[b][s] == '':
+                    batch_labels.append(1)
+                else:
+                    batch_labels.append(0)
+            
+            num_labels.append(batch_labels)
+        
+        total_loss = bce_loss(features.squeeze(2), torch.Tensor(num_labels).to(device))
+        
+        return total_loss
 
 class SupConLoss(nn.Module):
     def __init__(self, phi, centroids, temperature=0.7):

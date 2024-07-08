@@ -154,7 +154,108 @@ def plot_hdbs_cluster(hdbs, features, labels):
         ax.scatter(
             cluster_center["component1"], 
             cluster_center["component2"], 
-            s=incluster_ratio * 20,
+            s=incluster_ratio * 30,
+            color=l_col, 
+            marker="*",
+            alpha=0.9,
+            zorder=10
+        )
+    
+    ax.set_title("estimated cluster={0}, real labels={1}\nunclustered samples={2}".format(n_clusters, len(label_set), unclustered_samples))
+    ax.legend(loc='center left', bbox_to_anchor=(1, 0.5))
+    ax.grid(True)
+
+    #plt.savefig("scatter_hdbs", bbox_inches='tight')
+    return fig
+
+def plot_bikm_cluster(bikm, features, labels):
+    n_clusters = bikm.cluster_centers_.shape[0]
+    cluster_labels = bikm.labels_
+    label_set = set(labels)
+    label_list = sorted(list(label_set))
+    label_to_idx = dict()
+    for l_idx, l in enumerate(label_list):
+        label_to_idx[l] = l_idx
+    
+    unclustered_samples = len(cluster_labels[cluster_labels < 0])
+
+    # PCA 2차원 축소
+    features_cent = np.vstack([features, bikm.cluster_centers_])
+    norm_x = StandardScaler().fit_transform(features_cent)
+    pca = PCA(n_components=2)
+    principal_component = pca.fit_transform(norm_x)
+    principal_df = pd.DataFrame(data=principal_component[:-n_clusters], columns = ['component1', 'component2'])
+    centroid_df = pd.DataFrame(data=principal_component[-n_clusters:], columns = ['component1', 'component2'])
+    principal_df["labels"] = labels
+    principal_df["cluster"] = cluster_labels
+    #explained_ratio = sum(pca.explained_variance_ratio_)
+
+    # Plot 그리기
+    sns.set_style("darkgrid")
+    fig = plt.figure(figsize=(16,9), dpi=300)
+    ax = fig.add_subplot()
+    label_cmap = ListedColormap(sns.color_palette("terrain", n_colors=len(label_list)).as_hex())
+    
+    for l in label_list:
+        l_df = principal_df.loc[principal_df["labels"] == l]
+        
+        display_label = l
+        if l == '':
+            display_label = "narrative"
+        
+        not_n = l_df[l_df["cluster"] >= 0]
+        noise = l_df[l_df["cluster"] < 0]
+        ax.scatter(
+            not_n["component1"],
+            not_n["component2"],
+            c=label_cmap.colors[label_to_idx[l]],
+            label=display_label,
+            alpha=0.5,
+            s=8,
+            zorder=5
+        )
+        
+        
+        if len(not_n) > 0:
+            ax.scatter(
+                noise["component1"],
+                noise["component2"],
+                c=label_cmap.colors[label_to_idx[l]],
+                alpha=0.2,
+                marker="X",
+                s=8,
+                zorder=0
+            )
+        else:
+            ax.scatter(
+                noise["component1"],
+                noise["component2"],
+                c=label_cmap.colors[label_to_idx[l]],
+                label=display_label,
+                alpha=0.2,
+                marker="X",
+                s=8,
+                zorder=0
+            )
+
+    for k in range(n_clusters):
+        cluster_center = centroid_df.iloc[k]
+        
+        cluster_df = principal_df[principal_df["cluster"] == k]
+        cluster_label_counts = cluster_df["labels"].value_counts()
+        majority_label = cluster_label_counts.index[0]
+        l_col = label_cmap.colors[label_to_idx[majority_label]]
+        
+        incluster_ratio = cluster_label_counts.iloc[0] / len(cluster_df)
+        
+        display_label = majority_label
+        if display_label == '':
+            display_label = "narrative"
+        
+        ax.scatter(
+            cluster_center["component1"], 
+            cluster_center["component2"], 
+            s=incluster_ratio * 30,
             color=l_col, 
             marker="*",
             alpha=0.9,

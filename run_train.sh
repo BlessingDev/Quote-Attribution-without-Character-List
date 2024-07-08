@@ -17,7 +17,7 @@ for(( a=0; a<5; a++)); do
             --learning_rate 2e-6 \
             --weight_decay 0.0 \
             --seed 201456 \
-            --max_epochs 15 \
+            --max_epochs 10 \
             --book_train_iter 2 \
             --loss_sig ${sigma_list[a]}
     done
