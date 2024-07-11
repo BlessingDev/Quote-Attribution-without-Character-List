@@ -208,12 +208,18 @@ loss에 대한 분석도 필요하다.
     - 우선 별개의 파라미터 없이 두 loss를 동일하게 더해서 사용
     - loss 계산시 narrative 분류 정확도만큼 contrastive loss를 통합
 - clustering 기법을 hdbscan에서 bisecting k-means로 변경
+- 결과
+    - classification을 거니 공간을 분할하는 능력도 함께 향상되는 양상을 보임. contrastive loss를 사용하는 것보다 분류기를 두는 것이 더 유용할지도 모름
+    - 차원은 (1024, 2048)로 실험 범위에서 가장 작을 때, 그리고 앵커를 계산하지 않을 때(sigma=1.0) 혹은 앵커만 계산할 때(sigma=0.0) 모델이 비교적 높은 성능을 보였다.
+    - 최고 성능은 차원 (1024, 2048), sigma=1.0에서 달성했다.
+
 
 추후
-여타 prototypical classification 연구 탐색 (Gram matrix)
-BERT 대신 RoBERTa 도입. 추후에는 T-5까지 고려
-공통적으로 클러스터링 안 된 샘플이 많을수록 점수가 높아지는 듯함. 그러나 이런 게 분류에는 매우 좋지 않음. 어떤 로스를 써야 -1 샘플이 줄어들지 고민해봐야할 것
+!여타 prototypical classification 연구 탐색 (Gram matrix)
+BERT 대신 RoBERTa 도입. 추후에는 T-5까지 고려 (X) 이미 RoBERTa 성능으로 충분함
 손실에서 앵커 거리의 중요도를 훈련이 진행됨에 따라 천천히 올리는 기법
+!분류 태스크로 멀티태스크 러닝(MTL)이나 지식 증류를 도입하여 성능을 올리는 것을 시도
+모델 평가는 Affinity Propagation에 homogeniety를 사용하는 것이 가장 reasonable해 보임
 
 
 domain incremental 고려 (여러 권의 책으로 batch 구성)

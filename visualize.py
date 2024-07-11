@@ -270,28 +270,31 @@ def plot_bikm_cluster(bikm, features, labels):
     return fig
 
 def plot_affinity_cluster(af, features, labels):
+    ###
     n_clusters = len(set(af.labels_))
+    cluster_labels = af.labels_
     label_set = set(labels)
     label_list = sorted(list(label_set))
     label_to_idx = dict()
     for l_idx, l in enumerate(label_list):
         label_to_idx[l] = l_idx
+    
+    unclustered_samples = len(cluster_labels[cluster_labels < 0])
 
-    # PCA 3차원 축소
+    # PCA 2차원 축소
     norm_x = StandardScaler().fit_transform(features)
-    pca = PCA(n_components=3)
+    pca = PCA(n_components=2)
     principal_component = pca.fit_transform(norm_x)
-    principal_df = pd.DataFrame(data=principal_component, columns = ['component1', 'component2', 'component3'])
+    principal_df = pd.DataFrame(data=principal_component, columns = ['component1', 'component2'])
     principal_df["labels"] = labels
-    principal_df["cluster"] = af.labels_
-    explained_ratio = sum(pca.explained_variance_ratio_)
+    principal_df["cluster"] = cluster_labels
+    #explained_ratio = sum(pca.explained_variance_ratio_)
 
     # Plot 그리기
     sns.set_style("darkgrid")
     fig = plt.figure(figsize=(16,9), dpi=300)
-    ax = fig.add_subplot(projection='3d')
-    label_cmap = ListedColormap(sns.color_palette("Set2", n_colors=len(label_list)).as_hex())
-    #cluster_cmap = ListedColormap(sns.color_palette("tab10", n_colors=n_clusters).as_hex())
+    ax = fig.add_subplot()
+    label_cmap = ListedColormap(sns.color_palette("terrain", n_colors=len(label_list)).as_hex())
     
     for l in label_list:
         l_df = principal_df.loc[principal_df["labels"] == l]
@@ -300,53 +303,68 @@ def plot_affinity_cluster(af, features, labels):
         if l == '':
             display_label = "narrative"
         
-        sc = ax.scatter(
-            l_df["component1"],
-            l_df["component2"],
-            l_df["component3"],
+        not_n = l_df[l_df["cluster"] >= 0]
+        noise = l_df[l_df["cluster"] < 0]
+        ax.scatter(
+            not_n["component1"],
+            not_n["component2"],
             c=label_cmap.colors[label_to_idx[l]],
             label=display_label,
-            alpha=0.2,
-            s=8
+            alpha=0.5,
+            s=8,
+            zorder=5
         )
+        
+        
+        if len(not_n) > 0:
+            ax.scatter(
+                noise["component1"],
+                noise["component2"],
+                c=label_cmap.colors[label_to_idx[l]],
+                alpha=0.2,
+                marker="X",
+                s=8,
+                zorder=0
+            )
+        else:
+            ax.scatter(
+                noise["component1"],
+                noise["component2"],
+                c=label_cmap.colors[label_to_idx[l]],
+                label=display_label,
+                alpha=0.2,
+                marker="X",
+                s=8,
+                zorder=0
+            )
 
     for k in range(n_clusters):
-        class_members = (af.labels_ == k)
         cluster_center = principal_df.iloc[af.cluster_centers_indices_[k]]
-        '''ax.scatter(
-            principal_df.iloc[af.cluster_centers_indices[k]]["component1"], 
-            principal_df.iloc[af.cluster_centers_indices[k]]["component2"],
-            principal_df.iloc[af.cluster_centers_indices[k]]["component3"],
-            color=label_cmap.colors[label_to_idx[principal_df.iloc[af.cluster_centers_indices[k]]["labels"]]], 
-            marker=".",
-            alpha=0.2
-        )'''
-
+        
         cluster_df = principal_df[principal_df["cluster"] == k]
-        majority_label = cluster_df["labels"].value_counts().index[0]
+        cluster_label_counts = cluster_df["labels"].value_counts()
+        majority_label = cluster_label_counts.index[0]
         l_col = label_cmap.colors[label_to_idx[majority_label]]
+        
+        incluster_ratio = cluster_label_counts.iloc[0] / len(cluster_df)
+        
+        display_label = majority_label
+        if display_label == '':
+            display_label = "narrative"
+        
         ax.scatter(
             cluster_center["component1"], 
             cluster_center["component2"], 
-            cluster_center["component3"], 
-            s=10, 
+            s=incluster_ratio * 30,
             color=l_col, 
-            marker="o"
+            marker="*",
+            alpha=0.9,
+            zorder=10
         )
-
-        for x_idx in principal_df[class_members].index:
-            x = principal_df.loc[x_idx]
-            plt.plot(
-                [cluster_center["component1"], x["component1"]], 
-                [cluster_center["component2"], x["component2"]], 
-                [cluster_center["component3"], x["component3"]], 
-                color=l_col,
-                alpha=0.2
-            )
     
-    ax.set_title("estimated cluster={0}, real labels={1}".format(n_clusters, len(label_set)))
+    ax.set_title("estimated cluster={0}, real labels={1}\nunclustered samples={2}".format(n_clusters, len(label_set), unclustered_samples))
     ax.legend(loc='center left', bbox_to_anchor=(1, 0.5))
     ax.grid(True)
 
-    #plt.savefig("scatter_af", bbox_inches='tight')
+    #plt.savefig("scatter_hdbs", bbox_inches='tight')
     return fig

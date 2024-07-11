@@ -184,6 +184,26 @@ def calc_adjusted_rand_with_bik(features, labels, draw_fig=False):
     result = metrics.adjusted_rand_score(labels_true=np.array(label_indices), labels_pred=cluster.labels_)
     return result, fig
 
+def calc_adjusted_rand_with_ap(features, labels, draw_fig=False):
+    speaker_list = list(set(labels))
+    labels_to_idx = dict()
+    n_labels = len(speaker_list)
+    
+    for i, l in enumerate(speaker_list):
+        labels_to_idx[l] = i
+    
+    
+    cluster = affinity_cluster(features, n_labels)
+    
+    label_indices = [labels_to_idx[l] for l in labels]
+    
+    fig = None
+    if draw_fig:
+        fig = visualize.plot_affinity_cluster(cluster, features, labels)
+    
+    result = metrics.adjusted_rand_score(labels_true=np.array(label_indices), labels_pred=cluster.labels_)
+    return result, fig
+
 def get_pred_accuracies(pred, labels, threshold=0.5):
     batch_size = pred.shape[0]
     sample_size = pred.shape[1]
