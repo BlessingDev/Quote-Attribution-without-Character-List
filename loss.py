@@ -184,6 +184,39 @@ class NarrativeDescLoss(nn.Module):
         
         return total_loss
 
+class SpeakerDescLoss(nn.Module):
+    def __init__(self, speakers):
+        super(SpeakerDescLoss, self).__init__()
+        
+        speakers = sorted(list(set(speakers)))
+        self.speaker_to_idx = dict()
+        
+        for i, speaker in enumerate(speakers):
+            self.speaker_to_idx[speaker] = i
+        
+        self.loss = nn.CrossEntropyLoss()
+    
+    def forward(self, features, labels):
+        batch_size = features.shape[0]
+        sample_size = features.shape[1]
+        
+        num_labels = []
+        for b in range(batch_size):
+            batch_labels = []
+            for s in range(sample_size):
+                batch_labels.append(self.speaker_to_idx[labels[b][s]])
+            
+            num_labels.append(batch_labels)
+        
+        
+        labels_tensor = torch.Tensor(num_labels).to(dtype=torch.long).to(features.device)
+        
+        loss = self.loss(features.permute((0, 2, 1)), labels_tensor)
+        
+        return loss
+        
+        
+
 class SupConLoss(nn.Module):
     def __init__(self, phi, centroids, temperature=0.7):
         super(SupConLoss, self).__init__()

@@ -1,12 +1,13 @@
 from argparse import Namespace, ArgumentParser
 from dataset import *
-from model.speaker_clustering import SpeakerClusterRoBERTa
-from cluster_supervised_contrastive_loss import ProtoSupConLoss, NarrativeDescLoss
+from model.speaker_clustering import SpeakerClusterRoBERTa, SpeakerPreClassificationRoBERTa
+from loss import ProtoSupConLoss, SpeakerDescLoss
 from torch.utils.tensorboard import SummaryWriter
 from typing import Tuple
 from collections import Counter
 
 from sklearn.cluster import KMeans
+from arguments import parse_arguments
 
 import torch
 import torch.optim as optim
@@ -133,7 +134,7 @@ def init_model_and_dataset(args:Namespace) -> Tuple[PDNCDataset, RobertaTokenize
     robert_config.feature_dimension = args.feature_dimension
     robert_config.feature_freedom = args.feature_freedom
     
-    model = SpeakerClusterRoBERTa(robert_config, model_name)
+    model = SpeakerPreClassificationRoBERTa(robert_config, model_name)
 
     if args.reload_from_files and os.path.exists(args.model_state_file):
         model.load_state_dict(torch.load(args.model_state_file))
@@ -328,12 +329,50 @@ def get_model_prediction(batch_dict, tokenizer, model, device):
         latent_feature = avg_pool(latent_features)
         desc_feature = avg_pool(desc_features)
 
-        y_pred = (latent_feature.squeeze(0), desc_feature)
+        y_pred = (latent_feature.squeeze(0), desc_feature.squeeze(0))
     else:
         y_pred = model(input_ids=batch_dict['x'], cls_idx=batch_dict["cls_index"])
 
     return y_pred
 
+def get_model_inference(batch_dict, tokenizer, model, device):
+    seq_length = np.sum(batch_dict["x_length"])
+    if seq_length > tokenizer.model_max_length:
+        # 문단 길이가 context window를 초과할 때
+        # 문단에서 발화자가 달라지지 않고 전체가 다 한 사람이 말한 것이거나 설명문이거나
+        # 여러 번 출력을 받아 pooling하는 방식으로 해결
+        process_num = (
+            seq_length // tokenizer.model_max_length) + 1
+        avg_pool = nn.AvgPool2d(
+            kernel_size=(process_num, 1), stride=1)
+        latent_features = []
+        
+        error_accum = 0
+                        
+        for i in range(process_num):
+            x_i = batch_dict['x'][0][i * tokenizer.model_max_length - error_accum: min(
+                seq_length, (i + 1) * tokenizer.model_max_length) - error_accum].reshape((1, -1))
+            if x_i[0][0] != tokenizer.cls_token_id:
+                x_i = batch_dict['x'][0][i * tokenizer.model_max_length - error_accum: min(
+                    seq_length, (i + 1) * tokenizer.model_max_length - 1) - error_accum].reshape((1, -1))
+                x_i = torch.cat(
+                    (torch.tensor([[tokenizer.cls_token_id]]).to(device), x_i), dim=1)
+                error_accum += 1
+
+            pred = model.inference(input_ids=x_i, cls_idx=[0])
+            latent_features.append(pred[0][0])
+
+        latent_features = torch.cat(latent_features, dim=0).reshape(
+            (1, process_num, latent_features[0].shape[0]))
+        latent_feature = avg_pool(latent_features)
+
+        y_pred = (latent_feature.squeeze(0), None)
+    else:
+        y_pred = model.inference(input_ids=batch_dict['x'], cls_idx=batch_dict["cls_index"])
+
+    return y_pred
+
+    
 def train_model(args, data_set, model):
     print(args)
     
@@ -379,16 +418,19 @@ def train_model(args, data_set, model):
     
     if args.debug:
         torch.autograd.set_detect_anomaly(True)
-    train_books = [
-        0, 1, 2, 4, 5, 6, 7, 9, 10, 11, 13, 14, 15, 16
-    ]
+    if args.train_books:
+        train_books = [int(l) for l in args.train_books.split()]
+    else:
+        train_books = []
     # 
-    val_books = [
-        3, 8, 12, 17
-    ]
-    test_books = [
-        18, 19, 20, 21
-    ]
+    if args.val_books:
+        val_books = [int(l) for l in args.val_books.split()]
+    else:
+        val_books = []
+    if args.test_books:
+        test_books = [int(l) for l in args.test_books.split()]
+    else:
+        test_books = []
     
     book_bar = tqdm.tqdm(desc='books', 
                         total=len(train_books),
@@ -433,7 +475,7 @@ def train_model(args, data_set, model):
                     should_detach_memories = (
                         (batch_index + 1) % args.detach_mems_step == 0)
                     
-                    y_pred = get_model_prediction(batch_dict, tokenizer, model, device)
+                    y_pred = get_model_inference(batch_dict, tokenizer, model, device)
 
                     # model에서 cls_idx의 feature만 나오니 이제 cls 위치를 따로 걸러낼 필요가 없어진다
                     cls_features.extend([feature.detach().cpu().numpy() for feature in y_pred[0]])
@@ -451,6 +493,10 @@ def train_model(args, data_set, model):
                     tf_writer.add_figure(tag="book{0}/train/speaker_pie".format(book), figure=fig, global_step=epoch_index)
                 
                 model.train()
+                cur_key = "book{0}".format(book)
+                model.add_classifier(cur_key, len(set(speakers)), device)
+                model.set_key(cur_key)
+                
                 iter_loss = []
                 log_distance = True
                 cluster_loss = ProtoSupConLoss(
@@ -460,7 +506,7 @@ def train_model(args, data_set, model):
                     epsilon=args.loss_epsilon
                 )
                 
-                desc_loss = NarrativeDescLoss()
+                desc_loss = SpeakerDescLoss(speakers)
                 
                 for book_iter_idx in range(args.book_train_iter):
                     data_set.set_book(book)
@@ -512,8 +558,8 @@ def train_model(args, data_set, model):
                         cur_con_loss, step_pos_dis, step_neg_dis = cluster_loss(latent_features, [labels])
                         
                         desc_features = y_pred[1]
-                        cur_desc_loss = desc_loss(desc_features, [batch_dict["speaker"]])
-                        acc_t = metric.get_pred_accuracies(desc_features, [batch_dict["speaker"]])
+                        cur_desc_loss = desc_loss(desc_features.unsqueeze(0), [batch_dict["speaker"]])
+                        acc_t = metric.get_pred_accuracies(desc_features.unsqueeze(0), [batch_dict["speaker"]], desc_loss.speaker_to_idx)
                         
                         # contrastive loss는 narrative 분류가 잘 된 만큼 loss 계산에 통합
                         cur_loss = acc_t * cur_con_loss + cur_desc_loss
@@ -607,7 +653,7 @@ def train_model(args, data_set, model):
                 for batch_index, batch_dict in enumerate(batch_generator):
                     should_detach_memories = (
                         (batch_index + 1) % args.detach_mems_step == 0)
-                    y_pred = get_model_prediction(batch_dict, tokenizer, model, device)
+                    y_pred = get_model_inference(batch_dict, tokenizer, model, device)
 
                     cls_features.extend([feature.detach().cpu().numpy() for feature in y_pred[0]])
                     speakers.extend(batch_dict["speaker"])
@@ -620,8 +666,8 @@ def train_model(args, data_set, model):
                 iter_loss = np.mean(iter_loss)
 
                 if not args.debug:
-                    adj_rand, _ = metric.calc_adjusted_rand_with_bik(labels=speakers, features=np.array(cls_features), draw_fig=False)
-                    tf_writer.add_scalar(tag="book{0}/train/adjusted rand index".format(book), scalar_value=adj_rand, global_step=epoch_index)
+                    homo, _ = metric.calc_adj_homo_with_af(labels=speakers, features=np.array(cls_features), draw_fig=False)
+                    tf_writer.add_scalar(tag="book{0}/train/homog score".format(book), scalar_value=homo, global_step=epoch_index)
                 
                 #train_state['train_loss'].append(iter_loss)
                 #train_state['train_acc'].append(running_acc)
@@ -629,7 +675,7 @@ def train_model(args, data_set, model):
                 tf_writer.add_scalar(tag="book{0}/train/acc".format(book), scalar_value=running_acc, global_step=epoch_index)
 
                 if not args.debug:
-                    book_bar.set_postfix(loss=running_loss, ari=adj_rand)
+                    book_bar.set_postfix(loss=running_loss, homo=homo)
                 
                 book_bar.update()
 
@@ -668,7 +714,7 @@ def train_model(args, data_set, model):
                 # 군집 밀집도 phi를 얻는다.
                 for batch_index, batch_dict in enumerate(batch_generator):
                     should_detach_memories = ((batch_index + 1) % args.detach_mems_step == 0)
-                    y_pred = get_model_prediction(batch_dict, tokenizer, model, device)
+                    y_pred = get_model_inference(batch_dict, tokenizer, model, device)
                     
                     cls_features.extend([feature.detach().cpu().numpy() for feature in y_pred[0]])
                     speakers.extend(batch_dict["speaker"])
@@ -683,11 +729,11 @@ def train_model(args, data_set, model):
                 
                 if epoch_index == 0:
                     fig = visualize.plot_speaker_pie(speakers, cur_title)
-                    tf_writer.add_figure(tag="book{0}/train/speaker_pie".format(book), figure=fig, global_step=epoch_index)
+                    tf_writer.add_figure(tag="book{0}/val/speaker_pie".format(book), figure=fig, global_step=epoch_index)
 
                 if not args.debug:
-                    adj_rand, fig = metric.calc_adjusted_rand_with_bik(labels=speakers, features=np.array(cls_features), draw_fig=True)
-                    tf_writer.add_scalar(tag="book{0}/val/adjusted rand index".format(book), scalar_value=adj_rand, global_step=epoch_index)
+                    homo, fig = metric.calc_adj_homo_with_af(labels=speakers, features=np.array(cls_features), draw_fig=True)
+                    tf_writer.add_scalar(tag="book{0}/val/homog score".format(book), scalar_value=homo, global_step=epoch_index)
 
                     tf_writer.add_figure(tag="book{0}/val/cluster result".format(book), figure=fig, global_step=epoch_index)
                 
@@ -702,6 +748,10 @@ def train_model(args, data_set, model):
                 book_loss = 0.
                 model.eval()
                 model.init_memories()
+                
+                cur_key = "book{0}".format(book)
+                model.add_classifier(cur_key, len(set(speakers)), device)
+                model.set_key(cur_key)
                 
                 # 앵커로 저장해둔 특징 벡터와 레이블 리스트
                 feature_anchor_info = dict()
@@ -719,6 +769,8 @@ def train_model(args, data_set, model):
                     log_distance=log_distance,
                     epsilon=args.loss_epsilon
                 )
+                desc_loss = SpeakerDescLoss(speakers)
+                
                 pos_dis_dict = {s: [] for s in set(speakers)}
                 neg_dis_dict = {s: [] for s in pos_dis_dict.keys()}
                 
@@ -739,10 +791,8 @@ def train_model(args, data_set, model):
                     # 단계 3. 손실을 계산합니다
                     cur_con_loss, step_pos_dis, step_neg_dis = cluster_loss(latent_features, [labels])
                     
-                    desc_features = y_pred[1]
-                    cur_desc_loss = desc_loss(desc_features, [batch_dict["speaker"]])
                         
-                    cur_loss = cur_con_loss + cur_desc_loss
+                    cur_loss = cur_con_loss
                     
                     
                     for s in pos_dis_dict.keys():
@@ -756,8 +806,8 @@ def train_model(args, data_set, model):
                     # 단계 3. 이동 손실과 이동 정확도를 계산합니다
                     book_loss += (cur_loss.item() - book_loss) / (batch_index + 1)
                     
-                    acc_t = metric.get_pred_accuracies(desc_features, [batch_dict["speaker"]])
-                    running_acc += (acc_t - running_acc) / (batch_index + 1)
+                    #acc_t = metric.get_pred_accuracies(desc_features, [batch_dict["speaker"]], desc_loss.speaker_to_idx)
+                    #running_acc += (acc_t - running_acc) / (batch_index + 1)
                     
                     # 진행 상태 막대 업데이트
                     val_bar.set_postfix(loss=book_loss)
@@ -772,13 +822,13 @@ def train_model(args, data_set, model):
 
                 running_loss += (book_loss - running_loss) / (val_batch_idx + 1)
                 if not args.debug:
-                    running_score += (adj_rand - running_score) / (val_batch_idx + 1)
+                    running_score += (homo - running_score) / (val_batch_idx + 1)
 
-                book_bar.set_postfix(loss=running_loss, ari=running_score)
+                book_bar.set_postfix(loss=running_loss, homo=running_score)
                 book_bar.update()
 
                 tf_writer.add_scalar(tag="book{0}/val/loss".format(book), scalar_value=book_loss, global_step=epoch_index)
-                tf_writer.add_scalar(tag="book{0}/val/acc".format(book), scalar_value=running_acc, global_step=epoch_index)
+                #tf_writer.add_scalar(tag="book{0}/val/acc".format(book), scalar_value=running_acc, global_step=epoch_index)
                 for s in pos_dis_dict.keys():
                     if len(pos_dis_dict[s]) > 0:
                         tf_writer.add_scalar(tag="book{0}/val/dis/{1}_pos_dis".format(book, s), scalar_value=np.mean(pos_dis_dict[s]), global_step=(epoch_index * args.book_train_iter + book_iter_idx))
@@ -831,170 +881,17 @@ def save_train_result(train_state, file_path):
     with open(file_path, "wt", encoding="utf-8") as fp:
         fp.write(json.dumps(train_state))
 
-def mt_args():
-    return Namespace(dataset_csv="datas/jeonla_dialect_jamo_integration.csv",
-                vectorizer_file="vectorizer.json",
-                model_state_file="model.pth",
-                train_state_file="train_state.json",
-                log_json_file="logs/train_at_{time}.json",
-                save_dir="model_storage/stan-JL_jamo",
-                reload_from_files=True,
-                expand_filepaths_to_save_dir=True,
-                cuda=True,
-                seed=1337,
-                learning_rate=5e-4,
-                batch_size=200,
-                num_epochs=100,
-                early_stopping_criteria=3,         
-                source_embedding_size=64, 
-                target_embedding_size=64,
-                encoding_size=128,
-                catch_keyboard_interrupt=True)
-
 def main():
-    parser = ArgumentParser()
-    
-    parser.add_argument(
-        "--dataset_path", 
-        type=str,
-        required=True,
-    )
-    
-    parser.add_argument(
-        "--save_dir",
-        type=str,
-        required=True
-    )
-    
-    parser.add_argument(
-        "--model_state_file",
-        type=str,
-        required=True
-    )
-    
-    parser.add_argument(
-        "--feature_dimension",
-        type=int,
-        default=1000
-    )
-    
-    parser.add_argument(
-        "--decoder_hidden",
-        type=int,
-        default=1024
-    )
-    parser.add_argument(
-        "--feature_freedom",
-        type=int,
-        default=1
-    )
-    
-    
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=10025
-    )
-    
-    parser.add_argument(
-        "--learning_rate",
-        default=2e-8,
-        type=float
-    )
-    
-    parser.add_argument(
-        "--adam_epsilon",
-        default=1e-8,
-        type=int
-    )
-    
-    parser.add_argument(
-        "--warmup_steps",
-        default=0,
-    )
-    
-    parser.add_argument(
-        "--weight_decay",
-        default=0.1,
-        type=float
-    )
-
-    parser.add_argument(
-        "--saved_anchor_num",
-        default=2,
-        type=int
-    )
-    
-    parser.add_argument(
-        "--detach_mems_step",
-        default=2,
-        type=int
-    )
-    
-    parser.add_argument(
-        "--loss_sig",
-        default=0.5,
-        type=float
-    )
-    
-    parser.add_argument(
-        "--loss_epsilon",
-        default=10,
-        type=int
-    )
-
-    parser.add_argument(
-        "--early_stopping_criteria",
-        default=5
-    )
-    
-    parser.add_argument(
-        "--max_epochs",
-        default=10,
-        type=int
-    )
-    
-    parser.add_argument(
-        "--book_train_iter",
-        default=2,
-        type=int
-    )
-    
-    parser.add_argument(
-        "--reload_from_files",
-        default=False,
-        type=bool
-    )
-    
-    parser.add_argument(
-        "--expand_filepaths_to_save_dir",
-        default=True,
-        type=bool
-    )
-    
-    parser.add_argument(
-        "--log_json_file",
-        default="train_at_{time}.json"
-    )
-    
-    parser.add_argument(
-        "--catch_keyboard_interrupt",
-        default=True,
-        type=bool
-    )
-    
-    parser.add_argument(
-        "--debug",
-        action='store_true',
-        default=False
-    )
+    parser = parse_arguments()
     
     '''args = parser.parse_args([
         "--dataset_path", "data/pdnc/novels",
+        "--train_books", "0",
+        "--val_books", "",
         "--save_dir", "models_storage/test",
         "--model_state_file", "model.pth",
-        "--feature_dimension", "10000",
-        "--decoder_hidden", "5000",
+        "--feature_dimension", "2048",
+        "--decoder_hidden", "1024",
         "--detach_mems_step", "5",
         "--learning_rate", "2e-6",
         "--weight_decay", "0.1",

@@ -4,6 +4,7 @@ import seaborn as sns
 
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
 import numpy as np
 import pandas as pd
 from collections import Counter
@@ -283,8 +284,8 @@ def plot_affinity_cluster(af, features, labels):
 
     # PCA 2차원 축소
     norm_x = StandardScaler().fit_transform(features)
-    pca = PCA(n_components=2)
-    principal_component = pca.fit_transform(norm_x)
+    tsne = TSNE(n_components=2)
+    principal_component = tsne.fit_transform(norm_x)
     principal_df = pd.DataFrame(data=principal_component, columns = ['component1', 'component2'])
     principal_df["labels"] = labels
     principal_df["cluster"] = cluster_labels

@@ -60,9 +60,42 @@ def calc_v_measure_with_af(features, labels, draw_fig=False):
     
     label_indices = [labels_to_idx[l] for l in labels]
     
-    fig = visualize.plot_affinity_cluster(cluster, features, labels)
+    fig = None
+    if draw_fig:
+        fig = visualize.plot_affinity_cluster(cluster, features, labels)
     result = metrics.homogeneity_completeness_v_measure(labels_true=np.array(label_indices), labels_pred=cluster.labels_)
+    
     return *result, fig
+
+def calc_adj_homo_with_af(features, labels, draw_fig=False):
+    cluster = affinity_cluster(features)
+    labels_to_idx = dict()
+    #n_clusters = len(set(cluster.labels_)) - (1 if -1 in cluster.labels_ else 0)
+    n_clusters = len(set(cluster.labels_))
+    
+    for idx in cluster.cluster_centers_indices_:
+        if labels_to_idx.get(labels[idx], None) is None:
+            labels_to_idx[labels[idx]] = cluster.labels_[idx]
+
+    # 할당 안 된 애들은 클러스터 숫자에 겹치지 않게 레이블 부여
+    curl = n_clusters
+    for l in labels:
+        if labels_to_idx.get(l, None) is None:
+            labels_to_idx[l] = curl
+            curl += 1
+    
+    label_indices = [labels_to_idx[l] for l in labels]
+    
+    fig = None
+    if draw_fig:
+        fig = visualize.plot_affinity_cluster(cluster, features, labels)
+    result = metrics.homogeneity_score(labels_true=np.array(label_indices), labels_pred=cluster.labels_)
+    
+    adj_scalar = len(labels_to_idx) / n_clusters
+    
+    # 수정한 점수를 반환한다.
+    # 수정한 점수는 예측 군집의 수가 정답 레이블 수에 가까울수록 본래 점수에 가까워진다.
+    return result * adj_scalar, fig
 
 def calc_v_measure_with_hdb(features, labels, draw_fig=False):
     cluster = hdbscan_cluster(features)
@@ -204,7 +237,7 @@ def calc_adjusted_rand_with_ap(features, labels, draw_fig=False):
     result = metrics.adjusted_rand_score(labels_true=np.array(label_indices), labels_pred=cluster.labels_)
     return result, fig
 
-def get_pred_accuracies(pred, labels, threshold=0.5):
+def get_binary_pred_accuracies(pred, labels, threshold=0.5):
     batch_size = pred.shape[0]
     sample_size = pred.shape[1]
     
@@ -223,6 +256,28 @@ def get_pred_accuracies(pred, labels, threshold=0.5):
     
     prob = F.sigmoid(pred)
     pred_labels = (prob > threshold).to(torch.int32).squeeze(2)
+    
+    corr_num = torch.sum((num_labels == pred_labels).to(torch.int32)).item()
+    total_num = torch.numel(pred)
+    
+    return corr_num / total_num
+
+def get_pred_accuracies(pred, labels, label_to_idx):
+    batch_size = pred.shape[0]
+    sample_size = pred.shape[1]
+    
+    num_labels = []
+    for b in range(batch_size):
+        batch_labels = []
+        for s in range(sample_size):
+            batch_labels.append(label_to_idx[labels[b][s]])
+            
+        num_labels.append(batch_labels)
+    
+    num_labels = torch.Tensor(num_labels).to(torch.long).to(pred.device)
+    
+    prob = F.softmax(pred, dim=2)
+    pred_labels = torch.argmax(prob, dim=2)
     
     corr_num = torch.sum((num_labels == pred_labels).to(torch.int32)).item()
     total_num = torch.numel(pred)
